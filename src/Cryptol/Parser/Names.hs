@@ -176,6 +176,7 @@ namesC vs prop =
     CArith t      -> namesT vs t
     CCmp t        -> namesT vs t
     CSignedCmp t  -> namesT vs t
+    CIndex t      -> namesT vs t
     CLiteral t1 t2-> Set.union (namesT vs t1) (namesT vs t2)
     CUser x ts    -> Set.insert x (Set.unions (map (namesT vs) ts))
     CLocated p _  -> namesC vs p
@@ -285,6 +286,7 @@ tnamesC prop =
     CArith t       -> tnamesT t
     CCmp t         -> tnamesT t
     CSignedCmp t   -> tnamesT t
+    CIndex t       -> tnamesT t
     CLiteral t1 t2 -> Set.union (tnamesT t1) (tnamesT t2)
     CUser x ts     -> Set.insert x (Set.unions (map tnamesT ts))
     CLocated p _   -> tnamesC p

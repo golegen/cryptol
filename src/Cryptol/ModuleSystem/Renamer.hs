@@ -549,6 +549,7 @@ instance Rename Prop where
     CArith t      -> CArith     <$> rename t
     CCmp t        -> CCmp       <$> rename t
     CSignedCmp t  -> CSignedCmp <$> rename t
+    CIndex t      -> CIndex     <$> rename t
     CLiteral l r  -> CLiteral   <$> rename l <*> rename r
     CUser qn ps   -> CUser      <$> renameType qn <*> traverse rename ps
     CLocated p' r -> withLoc r

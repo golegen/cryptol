@@ -397,6 +397,7 @@ checkProp prop =
     P.CArith t1      -> tcon (PC PArith)         [t1]    (Just KProp)
     P.CCmp t1        -> tcon (PC PCmp)           [t1]    (Just KProp)
     P.CSignedCmp t1  -> tcon (PC PSignedCmp)     [t1]    (Just KProp)
+    P.CIndex t1      -> tcon (PC PIndex)         [t1]    (Just KProp)
     P.CLiteral t1 t2 -> tcon (PC PLiteral)       [t1,t2] (Just KProp)
     P.CUser x ts     -> checkTUser x ts (Just KProp)
     P.CLocated p r1  -> kInRange r1 (checkProp p)

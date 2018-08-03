@@ -74,6 +74,9 @@ primTyList =
   , tPrefix "SignedCmp"        PC PSignedCmp
     "Value types that support signed comparisons."
 
+  , tPrefix "Index"            PC PIndex
+    "Value types that support indexing and shifting operations."
+
   , tPrefix "Literal"         PC PLiteral
     "'Literal n a' asserts that type 'a' contains the number 'n'."
 
@@ -224,6 +227,7 @@ instance HasKind PC where
       PArith     -> KType :-> KProp
       PCmp       -> KType :-> KProp
       PSignedCmp -> KType :-> KProp
+      PIndex     -> KType :-> KProp
       PLiteral   -> KNum :-> KType :-> KProp
       PAnd       -> KProp :-> KProp :-> KProp
       PTrue      -> KProp
@@ -269,6 +273,7 @@ data PC     = PEqual        -- ^ @_ == _@
             | PArith        -- ^ @Arith _@
             | PCmp          -- ^ @Cmp _@
             | PSignedCmp    -- ^ @SignedCmp _@
+            | PIndex        -- ^ @Index _@
             | PLiteral      -- ^ @Literal _ _@
 
             | PAnd          -- ^ This is useful when simplifying things in place
@@ -383,6 +388,7 @@ instance PP PC where
       PArith     -> text "Arith"
       PCmp       -> text "Cmp"
       PSignedCmp -> text "SignedCmp"
+      PIndex     -> text "Index"
       PLiteral   -> text "Literal"
       PTrue      -> text "True"
       PAnd       -> text "(&&)"

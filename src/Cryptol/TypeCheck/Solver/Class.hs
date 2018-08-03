@@ -16,6 +16,7 @@ module Cryptol.TypeCheck.Solver.Class
   , solveArithInst
   , solveCmpInst
   , solveSignedCmpInst
+  , solveIndexInst
   , solveLiteralInst
   , expandProp
   ) where
@@ -206,6 +207,29 @@ solveSignedCmpInst ty = case tNoUser ty of
   TRec fs -> SolvedIf [ pSignedCmp e | (_,e) <- fs ]
 
   _ -> Unsolved
+
+
+-- | Solve Index constraints.
+solveIndexInst :: Type -> Solved
+solveIndexInst ty =
+  case tNoUser ty of
+
+    -- Index Error -> fails
+    TCon (TError _ e) _ -> Unsolvable e
+
+    -- Index Integer
+    TCon (TC TCInteger) [] -> SolvedIf []
+
+    -- (fin bits) => Index [bits]
+    TCon (TC TCSeq) [bits, elTy]
+      | TCon (TC TCBit) [] <- ety -> SolvedIf [ pFin bits ]
+      | TVar _ <- ety -> Unsolved
+      where ety = tNoUser elTy
+
+    TVar _ -> Unsolved
+
+    _ -> Unsolvable $ TCErrorMessage $ show
+         $ "Type" <+> quotes (pp ty) <+> "does not support literals."
 
 
 -- | Solve Literal constraints.

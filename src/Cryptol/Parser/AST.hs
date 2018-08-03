@@ -347,6 +347,7 @@ data Prop n   = CFin (Type n)             -- ^ @ fin x   @
               | CArith (Type n)           -- ^ @ Arith a @
               | CCmp (Type n)             -- ^ @ Cmp a @
               | CSignedCmp (Type n)       -- ^ @ SignedCmp a @
+              | CIndex (Type n)           -- ^ @ Index a @
               | CLiteral (Type n) (Type n)-- ^ @ Literal val a @
               | CUser n [Type n]          -- ^ Constraint synonym
               | CLocated (Prop n) Range   -- ^ Location information
@@ -818,6 +819,7 @@ instance PPName name => PP (Prop name) where
       CArith t       -> text "Arith" <+> ppPrec 4 t
       CCmp t         -> text "Cmp"   <+> ppPrec 4 t
       CSignedCmp t   -> text "SignedCmp" <+> ppPrec 4 t
+      CIndex t       -> text "Index" <+> ppPrec 4 t
       CLiteral t1 t2 -> text "Literal" <+> ppPrec 4 t1 <+> ppPrec 4 t2
       CEqual t1 t2   -> ppPrec 2 t1 <+> text "==" <+> ppPrec 2 t2
       CNeq t1 t2     -> ppPrec 2 t1 <+> text "!=" <+> ppPrec 2 t2
@@ -997,6 +999,7 @@ instance NoPos (Prop name) where
       CArith x      -> CArith (noPos x)
       CCmp x        -> CCmp   (noPos x)
       CSignedCmp x  -> CSignedCmp (noPos x)
+      CIndex x      -> CIndex (noPos x)
       CLiteral x y  -> CLiteral (noPos x) (noPos y)
       CUser x y     -> CUser x (noPos y)
       CLocated c _  -> noPos c
