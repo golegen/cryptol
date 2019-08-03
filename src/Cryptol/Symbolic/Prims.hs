@@ -27,7 +27,9 @@ import Cryptol.Eval.Monad (Eval(..), ready, invalidIndex, cryUserError)
 import Cryptol.Eval.Type  (finNat', TValue(..))
 import Cryptol.Eval.Value (BitWord(..), EvalPrims(..), enumerateSeqMap, SeqMap(..),
                           reverseSeqMap, wlam, nlam, WordValue(..),
-                          asWordVal, fromWordVal, enumerateWordValue,
+                          asWordVal, fromWordVal, fromBit,
+                          enumerateWordValue, enumerateWordValueRev,
+                          wordValueSize,
                           updateWordValue,
                           updateSeqMap, lookupSeqMap, memoMap )
 import Cryptol.Prims.Eval (binary, unary, arithUnary,
@@ -35,15 +37,14 @@ import Cryptol.Prims.Eval (binary, unary, arithUnary,
                            logicBinary, logicUnary, zeroV,
                            ccatV, splitAtV, joinV, ecSplitV,
                            reverseV, infFromV, infFromThenV,
-                           fromThenV, fromToV, fromThenToV,
+                           fromToV, fromThenToV,
                            transposeV, indexPrim,
                            ecToIntegerV, ecFromIntegerV,
                            ecNumberV, updatePrim, randomV, liftWord,
                            cmpValue, lg2)
 import Cryptol.Symbolic.Value
 import Cryptol.TypeCheck.AST (Decl(..))
-import Cryptol.TypeCheck.Solver.InfNat(Nat'(..))
-import Cryptol.Utils.Panic
+import Cryptol.TypeCheck.Solver.InfNat (Nat'(..), widthInteger)
 import Cryptol.ModuleSystem.Name (asPrim)
 import Cryptol.Utils.Ident (Ident,mkIdent)
 
@@ -62,11 +63,9 @@ traverseSnd f (x, y) = (,) x <$> f y
 -- Primitives ------------------------------------------------------------------
 
 instance EvalPrims SBool SWord SInteger where
-  evalPrim Decl { dName = n, .. }
-    | Just prim <- asPrim n, Just val <- Map.lookup prim primTable = val
-
-  evalPrim Decl { .. } =
-      panic "Eval" [ "Unimplemented primitive", show dName ]
+  evalPrim Decl { dName = n, .. } =
+    do prim <- asPrim n
+       Map.lookup prim primTable
 
   iteValue b x1 x2
     | Just b' <- SBV.svAsBool b = if b' then x1 else x2
@@ -183,7 +182,6 @@ primTable  = Map.fromList $ map (\(n, v) -> (mkIdent (T.pack n), v))
                     tlam $ \c ->
                      lam $ \xs -> transposeV a b c =<< xs)
 
-  , ("fromThen"    , fromThenV)
   , ("fromTo"      , fromToV)
   , ("fromThenTo"  , fromThenToV)
   , ("infFrom"     , infFromV)
@@ -285,25 +283,6 @@ logicShift nm wop reindex =
           _ -> evalPanic "expected sequence value in shift operation" [nm]
 
 
-selectV :: forall a
-         . (SBool -> Eval a -> Eval a -> Eval a) -- ^ Mux function on @a@s
-        -> WordValue SBool SWord SInteger        -- ^ Symbolic index value
-        -> (Integer -> Eval a)                   -- ^ Function from concrete indices to answers
-        -> Eval a                                -- ^ overall answer
-selectV mux val f =
-   case val of
-     WordVal x | Just idx <- SBV.svAsInteger x -> f idx
-               | otherwise -> sel 0 (unpackWord x)
-     BitsVal bs -> sel 0 =<< sequence (Fold.toList bs)
-     LargeBitsVal n xs -> sel 0 . map fromVBit =<< sequence (enumerateSeqMap n xs)
-
- where
-    sel offset []       = f offset
-    sel offset (b : bs) = mux b m1 m2
-      where m1 = sel (offset + (2 ^ length bs)) bs
-            m2 = sel offset bs
-
-
 indexFront :: Maybe Integer
            -> TValue
            -> SeqMap SBool SWord SInteger
@@ -377,6 +356,29 @@ indexBack_bits (Just n) a xs idx = indexFront_bits (Just n) a (reverseSeqMap n x
 indexBack_bits Nothing _ _ _ = evalPanic "Expected finite sequence" ["indexBack_bits"]
 
 
+-- | Compare a symbolic word value with a concrete integer.
+wordValueEqualsInteger :: WordValue SBool SWord SInteger -> Integer -> Eval SBool
+wordValueEqualsInteger wv i
+  | wordValueSize wv < widthInteger i = return SBV.svFalse
+  | otherwise =
+    case wv of
+      WordVal w -> return $ SBV.svEqual w (literalSWord (SBV.intSizeOf w) i)
+      _ -> bitsAre i <$> enumerateWordValueRev wv -- little-endian
+  where
+    bitsAre :: Integer -> [SBool] -> SBool
+    bitsAre n [] = SBV.svBool (n == 0)
+    bitsAre n (b : bs) = SBV.svAnd (bitIs (odd n) b) (bitsAre (n `div` 2) bs)
+
+    bitIs :: Bool -> SBool -> SBool
+    bitIs b x = if b then x else SBV.svNot x
+
+lazyMergeBit :: SBool -> Eval SBool -> Eval SBool -> Eval SBool
+lazyMergeBit c x y =
+  case SBV.svAsBool c of
+    Just True -> x
+    Just False -> y
+    Nothing -> mergeBit False c <$> x <*> y
+
 updateFrontSym
   :: Nat'
   -> TValue
@@ -384,18 +386,17 @@ updateFrontSym
   -> WordValue SBool SWord SInteger
   -> Eval (GenValue SBool SWord SInteger)
   -> Eval (SeqMap SBool SWord SInteger)
-updateFrontSym len _eltTy vs w val = do
-  -- TODO? alternate handling if w is a list of bits...
-  case w of
-    WordVal wv | Just j <- SBV.svAsInteger wv -> do
-        case len of
-          Inf -> return ()
-          Nat n -> unless (j < n) (invalidIndex j)
-        return $ updateSeqMap vs j val
+updateFrontSym len _eltTy vs wv val =
+  case wv of
+    WordVal w | Just j <- SBV.svAsInteger w ->
+      do case len of
+           Inf -> return ()
+           Nat n -> unless (j < n) (invalidIndex j)
+         return $ updateSeqMap vs j val
     _ ->
-        return $ IndexSeqMap $ \i ->
-          selectV iteValue w $ \j ->
-            if i == j then val else lookupSeqMap vs i
+      return $ IndexSeqMap $ \i ->
+      do b <- wordValueEqualsInteger wv i
+         iteValue b val (lookupSeqMap vs i)
 
 updateFrontSym_word
   :: Nat'
@@ -405,8 +406,21 @@ updateFrontSym_word
   -> Eval (GenValue SBool SWord SInteger)
   -> Eval (WordValue SBool SWord SInteger)
 updateFrontSym_word Inf _ _ _ _ = evalPanic "Expected finite sequence" ["updateFrontSym_bits"]
-updateFrontSym_word (Nat _) _eltTy bs w val =
-  selectV (mergeWord' True) w $ \j -> updateWordValue bs j (fromVBit <$> val)
+updateFrontSym_word (Nat n) eltTy bv wv val =
+  case wv of
+    WordVal w | Just j <- SBV.svAsInteger w ->
+      do unless (j < n) (invalidIndex j)
+         updateWordValue bv j (fromVBit <$> val)
+    _ ->
+      case bv of
+        WordVal bw -> return $ BitsVal $ Seq.mapWithIndex f bs
+                        where bs = fmap return $ Seq.fromList $ unpackWord bw
+        BitsVal bs -> return $ BitsVal $ Seq.mapWithIndex f bs
+        LargeBitsVal l vs -> LargeBitsVal l <$> updateFrontSym (Nat n) eltTy vs wv val
+  where
+    f :: Int -> Eval SBool -> Eval SBool
+    f i x = do c <- wordValueEqualsInteger wv (toInteger i)
+               lazyMergeBit c (fromBit =<< val) x
 
 updateBackSym
   :: Nat'
@@ -416,16 +430,15 @@ updateBackSym
   -> Eval (GenValue SBool SWord SInteger)
   -> Eval (SeqMap SBool SWord SInteger)
 updateBackSym Inf _ _ _ _ = evalPanic "Expected finite sequence" ["updateBackSym"]
-updateBackSym (Nat n) _eltTy vs w val = do
-  -- TODO? alternate handling if w is a list of bits...
-  case w of
-    WordVal wv | Just j <- SBV.svAsInteger wv -> do
-        unless (j < n) (invalidIndex j)
-        return $ updateSeqMap vs (n - j - 1) val
+updateBackSym (Nat n) _eltTy vs wv val =
+  case wv of
+    WordVal w | Just j <- SBV.svAsInteger w ->
+      do unless (j < n) (invalidIndex j)
+         return $ updateSeqMap vs (n - 1 - j) val
     _ ->
-        return $ IndexSeqMap $ \i ->
-          selectV iteValue w $ \j ->
-            if i == (n - j - 1) then val else lookupSeqMap vs i
+      return $ IndexSeqMap $ \i ->
+      do b <- wordValueEqualsInteger wv (n - 1 - i)
+         iteValue b val (lookupSeqMap vs i)
 
 updateBackSym_word
   :: Nat'
@@ -435,8 +448,21 @@ updateBackSym_word
   -> Eval (GenValue SBool SWord SInteger)
   -> Eval (WordValue SBool SWord SInteger)
 updateBackSym_word Inf _ _ _ _ = evalPanic "Expected finite sequence" ["updateBackSym_bits"]
-updateBackSym_word (Nat n) _eltTy bs w val = do
-  selectV (mergeWord' True) w $ \j -> updateWordValue bs (n - j - 1) (fromVBit <$> val)
+updateBackSym_word (Nat n) eltTy bv wv val = do
+  case wv of
+    WordVal w | Just j <- SBV.svAsInteger w ->
+      do unless (j < n) (invalidIndex j)
+         updateWordValue bv (n - 1 - j) (fromVBit <$> val)
+    _ ->
+      case bv of
+        WordVal bw -> return $ BitsVal $ Seq.mapWithIndex f bs
+                        where bs = fmap return $ Seq.fromList $ unpackWord bw
+        BitsVal bs -> return $ BitsVal $ Seq.mapWithIndex f bs
+        LargeBitsVal l vs -> LargeBitsVal l <$> updateBackSym (Nat n) eltTy vs wv val
+  where
+    f :: Int -> Eval SBool -> Eval SBool
+    f i x = do c <- wordValueEqualsInteger wv (n - 1 - toInteger i)
+               lazyMergeBit c (fromBit =<< val) x
 
 asBitList :: [Eval SBool] -> Maybe [SBool]
 asBitList = go id

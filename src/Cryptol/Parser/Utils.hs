@@ -17,18 +17,20 @@ module Cryptol.Parser.Utils
   ) where
 
 import Cryptol.Parser.AST
-import Cryptol.Prims.Syntax
-import Cryptol.TypeCheck.Type (TCon(TF))
 
 
 widthIdent :: Ident
 widthIdent  = mkIdent "width"
 
+underIdent :: Ident
+underIdent = mkIdent "_"
+
 translateExprToNumT :: Expr PName -> Maybe (Type PName)
 translateExprToNumT expr =
   case expr of
     ELocated e r -> (`TLocated` r) `fmap` translateExprToNumT e
-    EVar n | getIdent n == widthIdent -> mkFun TCWidth
+    EVar n | getIdent n == widthIdent -> pure (TUser n [])
+           | getIdent n == underIdent -> pure TWild
     EVar x       -> return (TUser x [])
     ELit x       -> cvtLit x
     EApp e1 e2   -> do t1 <- translateExprToNumT e1
@@ -48,11 +50,8 @@ translateExprToNumT expr =
   tApp ty t =
     case ty of
       TLocated t1 r -> (`TLocated` r) `fmap` tApp t1 t
-      TApp f ts     -> return (TApp f (ts ++ [t]))
       TUser f ts    -> return (TUser f (ts ++ [t]))
       _             -> Nothing
-
-  mkFun f = return (TApp (TF f) [])
 
   cvtLit (ECNum n CharLit)  = return (TChar $ toEnum $ fromInteger n)
   cvtLit (ECNum n _)        = return (TNum n)

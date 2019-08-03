@@ -16,6 +16,7 @@ import           Cryptol.Eval (EvalEnv,EvalOpts(..))
 
 import qualified Cryptol.Eval.Monad           as E
 import           Cryptol.ModuleSystem.Env
+import           Cryptol.ModuleSystem.Fingerprint
 import           Cryptol.ModuleSystem.Interface
 import           Cryptol.ModuleSystem.Name (FreshM(..),Supply)
 import           Cryptol.ModuleSystem.Renamer
@@ -37,13 +38,16 @@ import Control.Monad.IO.Class
 import Control.Exception (IOException)
 import Data.Function (on)
 import Data.Maybe (isJust)
+import Data.Text.Encoding.Error (UnicodeException)
 import MonadLib
+import System.Directory (canonicalizePath)
 
 import GHC.Generics (Generic)
 import Control.DeepSeq
 
 import Prelude ()
 import Prelude.Compat
+
 
 -- Errors ----------------------------------------------------------------------
 
@@ -76,9 +80,11 @@ data ModuleError
     -- ^ Unable to find the module given, tried looking in these paths
   | CantFindFile FilePath
     -- ^ Unable to open a file
+  | BadUtf8 ModulePath UnicodeException
+    -- ^ Bad UTF-8 encoding in while decoding this file
   | OtherIOError FilePath IOException
     -- ^ Some other IO error occurred while reading this file
-  | ModuleParseError FilePath Parser.ParseError
+  | ModuleParseError ModulePath Parser.ParseError
     -- ^ Generated this parse error when parsing the file for module m
   | RecursiveModules [ImportSource]
     -- ^ Recursive module group discovered
@@ -102,7 +108,7 @@ data ModuleError
     -- ^ Failed to add the module parameters to all definitions in a module.
   | NotAParameterizedModule P.ModName
 
-  | ErrorInFile FilePath ModuleError
+  | ErrorInFile ModulePath ModuleError
     -- ^ This is just a tag on the error, indicating the file containing it.
     -- It is convenient when we had to look for the module, and we'd like
     -- to communicate the location of pthe problematic module to the handler.
@@ -113,6 +119,7 @@ instance NFData ModuleError where
   rnf e = case e of
     ModuleNotFound src path              -> src `deepseq` path `deepseq` ()
     CantFindFile path                    -> path `deepseq` ()
+    BadUtf8 path ue                      -> rnf (path, ue)
     OtherIOError path exn                -> path `deepseq` exn `seq` ()
     ModuleParseError source err          -> source `deepseq` err `deepseq` ()
     RecursiveModules mods                -> mods `deepseq` ()
@@ -145,6 +152,10 @@ instance PP ModuleError where
     CantFindFile path ->
       text "[error]" <+>
       text "can't find file:" <+> text path
+
+    BadUtf8 path _ue ->
+      text "[error]" <+>
+      text "bad utf-8 encoding:" <+> pp path
 
     OtherIOError path exn ->
       hang (text "[error]" <+>
@@ -198,10 +209,13 @@ moduleNotFound name paths = ModuleT (raise (ModuleNotFound name paths))
 cantFindFile :: FilePath -> ModuleM a
 cantFindFile path = ModuleT (raise (CantFindFile path))
 
+badUtf8 :: ModulePath -> UnicodeException -> ModuleM a
+badUtf8 path ue = ModuleT (raise (BadUtf8 path ue))
+
 otherIOError :: FilePath -> IOException -> ModuleM a
 otherIOError path exn = ModuleT (raise (OtherIOError path exn))
 
-moduleParseError :: FilePath -> Parser.ParseError -> ModuleM a
+moduleParseError :: ModulePath -> Parser.ParseError -> ModuleM a
 moduleParseError path err =
   ModuleT (raise (ModuleParseError path err))
 
@@ -248,7 +262,7 @@ notAParameterizedModule x = ModuleT (raise (NotAParameterizedModule x))
 
 -- | Run the computation, and if it caused and error, tag the error
 -- with the given file.
-errorInFile :: FilePath -> ModuleM a -> ModuleM a
+errorInFile :: ModulePath -> ModuleM a -> ModuleM a
 errorInFile file (ModuleT m) = ModuleT (m `handle` h)
   where h e = raise $ case e of
                         ErrorInFile {} -> e
@@ -402,11 +416,11 @@ getImportSource  = ModuleT $ do
     _      -> return (FromModule noModuleName)
 
 getIface :: P.ModName -> ModuleM Iface
-getIface mn = ModuleT $ do
-  env <- get
-  case lookupModule mn env of
-    Just lm -> return (lmInterface lm)
-    Nothing -> panic "ModuleSystem" ["Interface not available", show (pp mn)]
+getIface mn =
+  do env <- ModuleT get
+     case lookupModule mn env of
+       Just lm -> return (lmInterface lm)
+       Nothing -> panic "ModuleSystem" ["Interface not available", show (pp mn)]
 
 getLoaded :: P.ModName -> ModuleM T.Module
 getLoaded mn = ModuleT $
@@ -444,10 +458,14 @@ unloadModule rm = ModuleT $ do
   env <- get
   set $! env { meLoadedModules = removeLoadedModule rm (meLoadedModules env) }
 
-loadedModule :: FilePath -> FilePath -> T.Module -> ModuleM ()
-loadedModule path canonicalPath m = ModuleT $ do
+loadedModule :: ModulePath -> Fingerprint -> T.Module -> ModuleM ()
+loadedModule path fp m = ModuleT $ do
   env <- get
-  set $! env { meLoadedModules = addLoadedModule path canonicalPath m (meLoadedModules env) }
+  ident <- case path of
+             InFile p  -> unModuleT $ io (canonicalizePath p)
+             InMem l _ -> pure l
+
+  set $! env { meLoadedModules = addLoadedModule path ident fp m (meLoadedModules env) }
 
 modifyEvalEnv :: (EvalEnv -> E.Eval EvalEnv) -> ModuleM ()
 modifyEvalEnv f = ModuleT $ do

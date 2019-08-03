@@ -10,6 +10,41 @@ Type Synonyms
     type String n = [n][8]
     type Word n = [n]
 
+Constraint Synonyms
+===================
+    type constraint i < j = j >= 1 + i
+    type constraint i <= j = j >= i
+    type constraint i > j = i >= 1 + j
+
+Primitive Types
+===============
+    (!=) : # -> # -> Prop
+    (==) : # -> # -> Prop
+    (>=) : # -> # -> Prop
+    (+) : # -> # -> #
+    (-) : # -> # -> #
+    (%) : # -> # -> #
+    (%^) : # -> # -> #
+    (*) : # -> # -> #
+    (/) : # -> # -> #
+    (/^) : # -> # -> #
+    (^^) : # -> # -> #
+    Arith : * -> Prop
+    Bit : *
+    Cmp : * -> Prop
+    fin : * -> Prop
+    Integer : *
+    inf : #
+    Literal : # -> * -> Prop
+    Logic : * -> Prop
+    lengthFromThenTo : # -> # -> # -> #
+    max : # -> # -> #
+    min : # -> # -> #
+    SignedCmp : * -> Prop
+    width : # -> #
+    Z : # -> *
+    Zero : * -> Prop
+
 Symbols
 =======
     (==>) : Bit -> Bit -> Bit
@@ -65,11 +100,6 @@ Symbols
     foldr : {n, a, b} (fin n) => (a -> b -> b) -> b -> [n]a -> b
     foo : {a} a -> a
     fromInteger : {a} (Arith a) => Integer -> a
-    fromThen :
-      {first, next, bits, len} (fin first, fin next, fin bits,
-                                bits >= width first, bits >= width next, first != next,
-                                lengthFromThen first next bits == len) =>
-        [len][bits]
     fromThenTo :
       {first, next, last, a, len} (fin first, fin next, fin last,
                                    Literal first a, Literal next a, Literal last a, first != next,
@@ -79,6 +109,9 @@ Symbols
       {first, last, a} (fin last, last >= first, Literal last a) =>
         [1 + (last - first)]a
     fromZ : {n} (fin n, n >= 1) => Z n -> Integer
+    generate :
+      {n, ix, a} (fin ix, n >= 1, ix >= width (n - 1)) =>
+        ([ix] -> a) -> [n]a
     groupBy :
       {each, parts, a} (fin each) => [each * parts]a -> [parts][each]a
     head : {n, a} [1 + n]a -> a

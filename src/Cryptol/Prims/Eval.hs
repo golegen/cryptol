@@ -24,7 +24,6 @@ import Control.Monad (join, unless)
 
 import Cryptol.TypeCheck.AST
 import Cryptol.TypeCheck.Solver.InfNat (Nat'(..),fromNat,genLog, nMul)
-import qualified Cryptol.Eval.Arch as Arch
 import Cryptol.Eval.Monad
 import Cryptol.Eval.Type
 import Cryptol.Eval.Value
@@ -49,11 +48,9 @@ import System.Random.TF.Gen (seedTFGen)
 -- Primitives ------------------------------------------------------------------
 
 instance EvalPrims Bool BV Integer where
-  evalPrim Decl { dName = n, .. }
-    | Just prim <- asPrim n, Just val <- Map.lookup prim primTable = val
-
-  evalPrim Decl { .. } =
-      panic "Eval" [ "Unimplemented primitive", show dName ]
+  evalPrim Decl { dName = n, .. } =
+    do prim <- asPrim n
+       Map.lookup prim primTable
 
   iteValue b t f = if b then t else f
 
@@ -172,8 +169,6 @@ primTable = Map.fromList $ map (\(n, v) -> (mkIdent (T.pack n), v))
                     lam  $ \ x     ->
                        splitAtV front back a =<< x)
 
-  , ("fromThen"   , {-# SCC "Prelude::fromThen" #-}
-                    fromThenV)
   , ("fromTo"     , {-# SCC "Prelude::fromTo" #-}
                     fromToV)
   , ("fromThenTo" , {-# SCC "Prelude::fromThenTo" #-}
@@ -224,9 +219,7 @@ mkLit ty =
   case ty of
     TVInteger                    -> VInteger . integerLit
     TVIntMod _                   -> VInteger . integerLit
-    TVSeq w TVBit
-      | w >= Arch.maxBigIntWidth -> wordTooWide w
-      | otherwise                -> word w
+    TVSeq w TVBit                -> word w
     _                            -> evalPanic "Cryptol.Eval.Prim.evalConst"
                                     [ "Invalid type for number" ]
 
@@ -434,6 +427,9 @@ arithBinary opw opi opz = loop
                  ]
          return $ VRecord fs'
 
+    TVAbstract {} ->
+      evalPanic "arithBinary" ["Abstract type not in `Arith`"]
+
 type UnaryArith w = Integer -> w -> Eval w
 
 liftUnaryArith :: (Integer -> Integer) -> UnaryArith BV
@@ -489,6 +485,8 @@ arithUnary opw opi opz = loop
                  ]
          return $ VRecord fs'
 
+    TVAbstract {} -> evalPanic "arithUnary" ["Abstract type not in `Arith`"]
+
 arithNullary ::
   forall b w i.
   BitWord b w i =>
@@ -519,6 +517,9 @@ arithNullary opw opi opz = loop
         TVTuple tys -> VTuple $ map (ready . loop) tys
 
         TVRec fs -> VRecord [ (f, ready (loop a)) | (f, a) <- fs ]
+
+        TVAbstract {} ->
+          evalPanic "arithNullary" ["Abstract type not in `Arith`"]
 
 lg2 :: Integer -> Integer
 lg2 i = case genLog i 2 of
@@ -582,6 +583,8 @@ cmpValue fb fw fi fz = cmp
                             cmpValues tys
                               (vals (fromVRecord v1))
                               (vals (fromVRecord v2)) k
+        TVAbstract {} -> evalPanic "cmpValue"
+                          [ "Abstract type not in `Cmp`" ]
 
     cmpValues (t : ts) (x1 : xs1) (x2 : xs2) k =
       do x1' <- x1
@@ -654,7 +657,7 @@ signedBV :: BV -> Integer
 signedBV (BV i x) = signedValue i x
 
 signedValue :: Integer -> Integer -> Integer
-signedValue i x = if testBit x (fromIntegral (i-1)) then x - (1 `shiftL` (fromIntegral i)) else x
+signedValue i x = if testBit x (fromInteger (i-1)) then x - (1 `shiftL` (fromInteger i)) else x
 
 bvSlt :: Integer -> Integer -> Integer -> Eval Value
 bvSlt _sz x y = return . VBit $! (x < y)
@@ -673,7 +676,7 @@ sshrV =
   nlam $ \_k ->
   wlam $ \(BV i x) -> return $
   wlam $ \y ->
-   let signx = testBit x (fromIntegral (i-1))
+   let signx = testBit x (fromInteger (i-1))
        amt   = fromInteger (bvVal y)
        negv  = (((-1) `shiftL` amt) .|. x) `shiftR` amt
        posv  = x `shiftR` amt
@@ -743,6 +746,8 @@ zeroV ty = case ty of
   -- records
   TVRec fields ->
     VRecord [ (f,ready $ zeroV fty) | (f,fty) <- fields ]
+
+  TVAbstract {} -> evalPanic "zeroV" [ "Abstract type not in `Zero`" ]
 
 --  | otherwise = evalPanic "zeroV" ["invalid type for zero"]
 
@@ -1123,6 +1128,9 @@ logicBinary opb opw = loop
                    ]
            return $ VRecord fs
 
+    TVAbstract {} -> evalPanic "logicBinary"
+                        [ "Abstract type not in `Logic`" ]
+
 
 wordValUnaryOp :: BitWord b w i
                => (b -> b)
@@ -1178,6 +1186,8 @@ logicUnary opb opw = loop
                  | (f,fty) <- fields, let a = lookupRecord f val
                  ]
          return $ VRecord fs
+
+    TVAbstract {} -> evalPanic "logicUnary" [ "Abstract type not in `Logic`" ]
 
 
 logicShift :: (Integer -> Integer -> Integer -> Integer)
@@ -1406,24 +1416,6 @@ updatePrim updateWord updateSeq =
       VStream vs -> VStream <$> updateSeq len eltTy vs idx' val
       _ -> evalPanic "Expected sequence value" ["updatePrim"]
 
--- @[ 0, 1 .. ]@
-fromThenV :: BitWord b w i
-          => GenValue b w i
-fromThenV  =
-  nlam $ \ first ->
-  nlam $ \ next  ->
-  nlam $ \ bits  ->
-  nlam $ \ len   ->
-    case (first, next, len, bits) of
-      (_         , _        , _       , Nat bits')
-        | bits' >= Arch.maxBigIntWidth -> wordTooWide bits'
-      (Nat first', Nat next', Nat len', Nat bits') ->
-        let diff = next' - first'
-         in VSeq len' $ IndexSeqMap $ \i ->
-                ready $ VWord bits' $ return $
-                  WordVal $ wordLit bits' (first' + i*diff)
-      _ -> evalPanic "fromThenV" ["invalid arguments"]
-
 -- @[ 0 .. 10 ]@
 fromToV :: BitWord b w i
         => GenValue b w i
@@ -1486,7 +1478,7 @@ randomV ty seed =
     Just gen ->
       -- unpack the seed into four Word64s
       let mask64 = 0xFFFFFFFFFFFFFFFF
-          unpack s = fromIntegral (s .&. mask64) : unpack (s `shiftR` 64)
+          unpack s = fromInteger (s .&. mask64) : unpack (s `shiftR` 64)
           [a, b, c, d] = take 4 (unpack seed)
       in fst $ gen 100 $ seedTFGen (a, b, c, d)
 
@@ -1523,3 +1515,5 @@ errorV ty msg = case ty of
   -- records
   TVRec fields ->
     return $ VRecord [ (f,errorV fty msg) | (f,fty) <- fields ]
+
+  TVAbstract {} -> cryUserError msg

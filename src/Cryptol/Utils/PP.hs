@@ -10,7 +10,7 @@
 
 {-# LANGUAGE DeriveAnyClass #-}
 {-# LANGUAGE DeriveGeneric #-}
-{-# LANGUAGE PatternGuards #-}
+{-# LANGUAGE OverloadedStrings #-}
 module Cryptol.Utils.PP where
 
 import           Cryptol.Utils.Ident
@@ -114,6 +114,9 @@ instance IsString Doc where
 render :: Doc -> String
 render d = PJ.render (runDoc mempty d)
 
+renderOneLine :: Doc -> String
+renderOneLine d = PJ.renderStyle (PJ.style { PJ.mode = PJ.OneLineMode }) (runDoc mempty d)
+
 class PP a where
   ppPrec :: Int -> a -> Doc
 
@@ -146,7 +149,7 @@ data Assoc = LeftAssoc | RightAssoc | NonAssoc
 data Infix op thing = Infix
   { ieOp    :: op       -- ^ operator
   , ieLeft  :: thing    -- ^ left argument
-  , ieRight :: thing    -- ^ right argumrnt
+  , ieRight :: thing    -- ^ right argument
   , iePrec  :: Int      -- ^ operator precedence
   , ieAssoc :: Assoc    -- ^ operator associativity
   }
@@ -174,7 +177,7 @@ ppInfix lp isInfix expr =
 
 
 
--- | Display a numeric values as an ordinar (e.g., 2nd)
+-- | Display a numeric value as an ordinal (e.g., 2nd)
 ordinal :: (Integral a, Show a, Eq a) => a -> Doc
 ordinal x = text (show x) <.> text (ordSuffix x)
 
@@ -253,6 +256,9 @@ brackets  = liftPJ1 PJ.brackets
 quotes :: Doc -> Doc
 quotes  = liftPJ1 PJ.quotes
 
+backticks :: Doc -> Doc
+backticks d = hcat [ "`", d, "`" ]
+
 punctuate :: Doc -> [Doc] -> [Doc]
 punctuate p = go
   where
@@ -290,3 +296,7 @@ instance PP Ident where
 instance PP ModName where
   ppPrec _   = text . T.unpack . modNameToText
 
+instance PP Assoc where
+  ppPrec _ LeftAssoc  = text "left-associative"
+  ppPrec _ RightAssoc = text "right-associative"
+  ppPrec _ NonAssoc   = text "non-associative"

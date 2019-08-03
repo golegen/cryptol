@@ -22,6 +22,7 @@ module Cryptol.REPL.Monad (
   , raise
   , stop
   , catch
+  , finally
   , rPutStrLn
   , rPutStr
   , rPrint
@@ -41,7 +42,8 @@ module Cryptol.REPL.Monad (
   , getTypeNames
   , getPropertyNames
   , getModNames
-  , LoadedModule(..), getLoadedMod, setLoadedMod, clearLoadedMod, setEditPath
+  , LoadedModule(..), getLoadedMod, setLoadedMod, clearLoadedMod
+  , setEditPath, getEditPath, clearEditPath
   , setSearchPath, prependSearchPath
   , getPrompt
   , shouldContinue
@@ -61,6 +63,7 @@ module Cryptol.REPL.Monad (
   , userOptions
   , getUserSatNum
   , getUserShowProverStats
+  , getUserProverValidate
 
     -- ** Configurable Output
   , getPutStr
@@ -120,15 +123,18 @@ import Prelude.Compat
 
 -- | This indicates what the user would like to work on.
 data LoadedModule = LoadedModule
-  { lName :: Maybe P.ModName -- ^ Working on this module.
-  , lPath :: FilePath        -- ^ Working on this file.
+  { lName :: Maybe P.ModName  -- ^ Working on this module.
+  , lPath :: M.ModulePath     -- ^ Working on this file.
   }
 
 -- | REPL RW Environment.
 data RW = RW
   { eLoadedMod   :: Maybe LoadedModule
     -- ^ This is the name of the currently "focused" module.
-    -- This is what we edit (:e) or reload (:r)
+    -- This is what we reload (:r)
+
+  , eEditFile :: Maybe FilePath
+    -- ^ This is what we edit (:e)
 
   , eContinue    :: Bool
     -- ^ Should we keep going when we encounter an error, or give up.
@@ -159,6 +165,7 @@ defaultRW isBatch l = do
   env <- M.initialModuleEnv
   return RW
     { eLoadedMod   = Nothing
+    , eEditFile    = Nothing
     , eContinue    = True
     , eIsBatch     = isBatch
     , eModuleEnv   = env
@@ -172,16 +179,35 @@ defaultRW isBatch l = do
 mkPrompt :: RW -> String
 mkPrompt rw
   | eIsBatch rw = ""
-  | otherwise   = modLab ++ "> "
+  | detailedPrompt = withEdit ++ "> "
+  | otherwise      = modLn ++ "> "
   where
-  modLab =
+  detailedPrompt = False
+
+  modLn   =
     case lName =<< eLoadedMod rw of
+      Nothing -> show (pp I.preludeName)
       Just m
         | M.isLoadedParamMod m (M.meLoadedModules (eModuleEnv rw)) ->
-              modName ++ " (parameterized) "
-         | otherwise -> modName
-         where modName = pretty m
-      Nothing -> "cryptol"
+                 modName ++ "(parameterized)"
+        | otherwise -> modName
+        where modName = pretty m
+
+  withFocus =
+    case eLoadedMod rw of
+      Nothing -> modLn
+      Just m ->
+        case (lName m, lPath m) of
+          (Nothing, M.InFile f) -> ":r to reload " ++ show f ++ "\n" ++ modLn
+          _ -> modLn
+
+  withEdit =
+    case eEditFile rw of
+      Nothing -> withFocus
+      Just e
+        | Just (M.InFile f) <- lPath <$> eLoadedMod rw
+        , f == e -> withFocus
+        | otherwise -> ":e to edit " ++ e ++ "\n" ++ withFocus
 
 
 
@@ -283,6 +309,9 @@ raise exn = io (X.throwIO exn)
 catch :: REPL a -> (REPLException -> REPL a) -> REPL a
 catch m k = REPL (\ ref -> rethrowEvalError (unREPL m ref) `X.catch` \ e -> unREPL (k e) ref)
 
+finally :: REPL a -> REPL b -> REPL a
+finally m1 m2 = REPL (\ref -> unREPL m1 ref `X.finally` unREPL m2 ref)
+
 
 rethrowEvalError :: IO a -> IO a
 rethrowEvalError m = run `X.catch` rethrow
@@ -321,18 +350,27 @@ clearLoadedMod = do modifyRW_ (\rw -> rw { eLoadedMod = upd <$> eLoadedMod rw })
                     updateREPLTitle
   where upd x = x { lName = Nothing }
 
--- | Set the name of the currently focused file, edited by @:e@ and loaded via
--- @:r@.
+-- | Set the name of the currently focused file, loaded via @:r@.
 setLoadedMod :: LoadedModule -> REPL ()
 setLoadedMod n = do
   modifyRW_ (\ rw -> rw { eLoadedMod = Just n })
   updateREPLTitle
 
-setEditPath :: FilePath -> REPL ()
-setEditPath p = setLoadedMod LoadedModule { lName = Nothing, lPath = p }
-
 getLoadedMod :: REPL (Maybe LoadedModule)
 getLoadedMod  = eLoadedMod `fmap` getRW
+
+
+
+-- | Set the path for the ':e' command.
+-- Note that this does not change the focused module (i.e., what ":r" reloads)
+setEditPath :: FilePath -> REPL ()
+setEditPath p = modifyRW_ $ \rw -> rw { eEditFile = Just p }
+
+getEditPath :: REPL (Maybe FilePath)
+getEditPath = eEditFile <$> getRW
+
+clearEditPath :: REPL ()
+clearEditPath = modifyRW_ $ \rw -> rw { eEditFile = Nothing }
 
 setSearchPath :: [FilePath] -> REPL ()
 setSearchPath path = do
@@ -679,6 +717,9 @@ badIsEnv x = panic "fromEnvVal" [ "[REPL] Expected a `" ++ x ++ "` value." ]
 getUserShowProverStats :: REPL Bool
 getUserShowProverStats = getKnownUser "prover-stats"
 
+getUserProverValidate :: REPL Bool
+getUserProverValidate = getKnownUser "prover-validate"
+
 -- Environment Options ---------------------------------------------------------
 
 type OptionMap = Trie OptionDescr
@@ -752,7 +793,7 @@ userOptions  = mkOptionMap
     "Enable type-checker debugging output." $
     \case EnvNum n -> do me <- getModuleEnv
                          let cfg = M.meSolverConfig me
-                         setModuleEnv me { M.meSolverConfig = cfg{ T.solverVerbose = fromIntegral n } }
+                         setModuleEnv me { M.meSolverConfig = cfg{ T.solverVerbose = n } }
           _        -> return ()
   , OptionDescr "core-lint" (EnvBool False)
     noCheck
@@ -765,6 +806,12 @@ userOptions  = mkOptionMap
 
   , simpleOpt "prover-stats" (EnvBool True) noCheck
     "Enable prover timing statistics."
+
+  , simpleOpt "prover-validate" (EnvBool False) noCheck
+    "Validate :sat examples and :prove counter-examples for correctness."
+
+  , simpleOpt "show-examples" (EnvBool True) noCheck
+    "Print the (counter) example after :sat or :prove"
   ]
 
 

@@ -7,7 +7,7 @@ dist
 results.xml
 dist-newstyle
 .stack-work
-.ghc.environment.x86_64-darwin-8.2.2
+.ghc.environment.*
 
 # don't check in generated documentation
 #docs/CryptolPrims.pdf
@@ -24,3 +24,7 @@ cryptol-2.*
 /ICryptol/profile_cryptol/security/
 /ICryptol/profile_cryptol/startup/
 /bench*.xml
+
+# ignore test suite output
+/bin
+/output

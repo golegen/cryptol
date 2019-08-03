@@ -61,24 +61,27 @@ noIfaceParams = IfaceParams
   }
 
 data IfaceDecls = IfaceDecls
-  { ifTySyns   :: Map.Map Name IfaceTySyn
-  , ifNewtypes :: Map.Map Name IfaceNewtype
-  , ifDecls    :: Map.Map Name IfaceDecl
+  { ifTySyns        :: Map.Map Name IfaceTySyn
+  , ifNewtypes      :: Map.Map Name IfaceNewtype
+  , ifAbstractTypes :: Map.Map Name IfaceAbstractType
+  , ifDecls         :: Map.Map Name IfaceDecl
   } deriving (Show, Generic, NFData)
 
 instance Semigroup IfaceDecls where
   l <> r = IfaceDecls
     { ifTySyns   = Map.union (ifTySyns l)   (ifTySyns r)
     , ifNewtypes = Map.union (ifNewtypes l) (ifNewtypes r)
+    , ifAbstractTypes = Map.union (ifAbstractTypes l) (ifAbstractTypes r)
     , ifDecls    = Map.union (ifDecls l)    (ifDecls r)
     }
 
 instance Monoid IfaceDecls where
-  mempty      = IfaceDecls Map.empty Map.empty Map.empty
+  mempty      = IfaceDecls Map.empty Map.empty Map.empty Map.empty
   mappend l r = l <> r
   mconcat ds  = IfaceDecls
     { ifTySyns   = Map.unions (map ifTySyns   ds)
     , ifNewtypes = Map.unions (map ifNewtypes ds)
+    , ifAbstractTypes = Map.unions (map ifAbstractTypes ds)
     , ifDecls    = Map.unions (map ifDecls    ds)
     }
 
@@ -88,6 +91,7 @@ ifTySynName :: TySyn -> Name
 ifTySynName = tsName
 
 type IfaceNewtype = Newtype
+type IfaceAbstractType = AbstractType
 
 data IfaceDecl = IfaceDecl
   { ifDeclName    :: !Name          -- ^ Name of thing
@@ -116,12 +120,14 @@ genIface m = Iface
   , ifPublic      = IfaceDecls
     { ifTySyns    = tsPub
     , ifNewtypes  = ntPub
+    , ifAbstractTypes = atPub
     , ifDecls     = dPub
     }
 
   , ifPrivate = IfaceDecls
     { ifTySyns    = tsPriv
     , ifNewtypes  = ntPriv
+    , ifAbstractTypes = atPriv
     , ifDecls     = dPriv
     }
 
@@ -139,6 +145,10 @@ genIface m = Iface
   (ntPub,ntPriv) =
       Map.partitionWithKey (\ qn _ -> qn `isExportedType` mExports m )
                            (mNewtypes m)
+
+  (atPub,atPriv) =
+    Map.partitionWithKey (\qn _ -> qn `isExportedType` mExports m)
+                         (mPrimTypes m)
 
   (dPub,dPriv) =
       Map.partitionWithKey (\ qn _ -> qn `isExportedBind` mExports m)

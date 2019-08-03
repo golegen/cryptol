@@ -4,7 +4,7 @@
 {-# Language OverloadedStrings #-}
 module Cryptol.TypeCheck.Type
   ( module Cryptol.TypeCheck.Type
-  , module Cryptol.Prims.Syntax
+  , module Cryptol.TypeCheck.TCon
   ) where
 
 
@@ -21,8 +21,8 @@ import Cryptol.Parser.Selector
 import Cryptol.Parser.Fixity
 import Cryptol.Parser.Position(Range,emptyRange)
 import Cryptol.ModuleSystem.Name
-import Cryptol.Prims.Syntax
 import Cryptol.Utils.Ident (Ident)
+import Cryptol.TypeCheck.TCon
 import Cryptol.TypeCheck.PP
 import Cryptol.TypeCheck.Solver.InfNat
 import Cryptol.Utils.Panic(panic)
@@ -186,6 +186,16 @@ data Newtype  = Newtype { ntName   :: Name
                         } deriving (Show, Generic, NFData)
 
 
+-- | Information about an abstract type.
+data AbstractType = AbstractType
+  { atName    :: Name
+  , atKind    :: Kind
+  , atCtrs    :: ([TParam], [Prop])
+  , atFixitiy :: Maybe Fixity
+  , atDoc     :: Maybe String
+  } deriving (Show, Generic, NFData)
+
+
 
 
 --------------------------------------------------------------------------------
@@ -277,6 +287,12 @@ newtypeConType nt =
   where
   as = ntParams nt
 
+
+abstractTypeTC :: AbstractType -> TCon
+abstractTypeTC at =
+  case builtInType (atName at) of
+    Just tcon -> tcon
+    _         -> TC $ TCAbstract $ UserTC (atName at) (atKind at)
 
 instance Eq TVar where
   TVBound x       == TVBound y       = x == y
@@ -433,7 +449,7 @@ pIsWidth ty = case tNoUser ty of
 
 
 tNum     :: Integral a => a -> Type
-tNum n    = TCon (TC (TCNum (fromIntegral n))) []
+tNum n    = TCon (TC (TCNum (toInteger n))) []
 
 tZero     :: Type
 tZero     = tNum (0 :: Int)
@@ -451,6 +467,9 @@ tNat'    :: Nat' -> Type
 tNat' n'  = case n' of
               Inf   -> tInf
               Nat n -> tNum n
+
+tAbstract :: UserTC -> [Type] -> Type
+tAbstract u ts = TCon (TC (TCAbstract u)) ts
 
 tBit     :: Type
 tBit      = TCon (TC TCBit) []
@@ -499,7 +518,11 @@ tNoUser t = case t of
 
 -- | Make a malformed numeric type.
 tBadNumber :: TCErrorMessage -> Type
-tBadNumber msg = TCon (TError KNum msg) []
+tBadNumber = tError KNum
+
+-- | Make an error value of the given type.
+tError :: Kind -> TCErrorMessage -> Type
+tError k msg = TCon (TError k msg) []
 
 tf1 :: TFun -> Type -> Type
 tf1 f x = TCon (TF f) [x]
@@ -509,14 +532,6 @@ tf2 f x y = TCon (TF f) [x,y]
 
 tf3 :: TFun -> Type -> Type -> Type -> Type
 tf3 f x y z = TCon (TF f) [x,y,z]
-
-{-
-tAdd :: Type -> Type -> Type
-tAdd x y
-  | Just x' <- tIsNum x
-  , Just y' <- tIsNum y = error (show x' ++ " + " ++ show y')
-  | otherwise = tf2 TCAdd x y
--}
 
 tSub :: Type -> Type -> Type
 tSub = tf2 TCSub
@@ -542,13 +557,8 @@ tCeilDiv = tf2 TCCeilDiv
 tCeilMod :: Type -> Type -> Type
 tCeilMod = tf2 TCCeilMod
 
-tLenFromThen :: Type -> Type -> Type -> Type
-tLenFromThen = tf3 TCLenFromThen
-
 tLenFromThenTo :: Type -> Type -> Type -> Type
 tLenFromThenTo = tf3 TCLenFromThenTo
-
-
 
 
 
@@ -721,13 +731,17 @@ instance PP TySyn where
 
 instance PP (WithNames TySyn) where
   ppPrec _ (WithNames ts ns) =
-    text "type" <+> ctr <+> pp (tsName ts) <+>
-      sep (map (ppWithNames ns1) (tsParams ts)) <+> char '='
-                <+> ppWithNames ns1 (tsDef ts)
+    text "type" <+> ctr <+> lhs <+> char '=' <+> ppWithNames ns1 (tsDef ts)
     where ns1 = addTNames (tsParams ts) ns
           ctr = case kindResult (kindOf ts) of
                   KProp -> text "constraint"
                   _     -> empty
+          n = tsName ts
+          lhs = case (nameFixity n, tsParams ts) of
+                  (Just _, [x, y]) ->
+                    ppWithNames ns1 x <+> pp (nameIdent n) <+> ppWithNames ns1 y
+                  (_, ps) ->
+                    pp n <+> sep (map (ppWithNames ns1) ps)
 
 instance PP Newtype where
   ppPrec = ppWithNamesPrec IntMap.empty
@@ -744,8 +758,12 @@ instance PP (WithNames Type) where
       TVar a  -> ppWithNames nmMap a
       TRec fs -> braces $ fsep $ punctuate comma
                     [ pp l <+> text ":" <+> go 0 t | (l,t) <- fs ]
+
+      _ | Just tinf <- isTInfix ty0 -> optParens (prec > 2)
+                                     $ ppInfix 2 isTInfix tinf
+
+      TUser c [] _ -> pp c
       TUser c ts _ -> optParens (prec > 3) $ pp c <+> fsep (map (go 4) ts)
-      -- TUser _ _ t -> ppPrec prec t -- optParens (prec > 3) $ pp c <+> fsep (map (go 4) ts)
 
       TCon (TC tc) ts ->
         case (tc,ts) of
@@ -782,23 +800,29 @@ instance PP (WithNames Type) where
 
           (_, _)              -> pp pc <+> fsep (map (go 4) ts)
 
-      _ | Just tinf <- isTInfix ty0 -> optParens (prec > 2)
-                                     $ ppInfix 2 isTInfix tinf
-
       TCon f ts -> optParens (prec > 3)
                 $ pp f <+> fsep (map (go 4) ts)
 
     where
     go p t = ppWithNamesPrec nmMap p t
 
-    isTInfix (WithNames (TCon (TF ieOp) [ieLeft',ieRight']) _) =
+    isTInfix (WithNames (TCon tc [ieLeft',ieRight']) _) =
       do let ieLeft  = WithNames ieLeft' nmMap
              ieRight = WithNames ieRight' nmMap
-         pt <- primTyFromTF ieOp
-         fi <- primTyFixity pt
+         (ieOp,fi) <- infixPrimTy tc
          let ieAssoc = fAssoc fi
              iePrec  = fLevel fi
          return Infix { .. }
+
+    isTInfix (WithNames (TUser n [ieLeft',ieRight'] _) _) =
+      do let ieLeft  = WithNames ieLeft' nmMap
+             ieRight = WithNames ieRight' nmMap
+         fi <- nameFixity n
+         let ieAssoc = fAssoc fi
+             iePrec  = fLevel fi
+             ieOp    = nameIdent n
+         return Infix { .. }
+
     isTInfix _ = Nothing
 
 

@@ -31,6 +31,10 @@ module Cryptol.Parser.AST
   , Kind(..)
   , Type(..)
   , Prop(..)
+  , tsName
+  , psName
+  , tsFixity
+  , psFixity
 
     -- * Declarations
   , Module(..)
@@ -48,6 +52,7 @@ module Cryptol.Parser.AST
   , TopLevel(..)
   , Import(..), ImportSpec(..)
   , Newtype(..)
+  , PrimType(..)
   , ParameterType(..)
   , ParameterFun(..)
 
@@ -61,6 +66,8 @@ module Cryptol.Parser.AST
   , Pattern(..)
   , Selector(..)
   , TypeInst(..)
+  , UpdField(..)
+  , UpdHow(..)
 
     -- * Positions
   , Located(..)
@@ -75,7 +82,6 @@ import Cryptol.Parser.Fixity
 import Cryptol.Parser.Name
 import Cryptol.Parser.Position
 import Cryptol.Parser.Selector
-import Cryptol.TypeCheck.Type (TCon(..))
 import Cryptol.Utils.Ident
 import Cryptol.Utils.PP
 
@@ -126,6 +132,7 @@ modRange m = rCombs $ catMaybes
 
 data TopDecl name =
     Decl (TopLevel (Decl name))
+  | DPrimType (TopLevel (PrimType name))
   | TDNewtype (TopLevel (Newtype name)) -- ^ @newtype T as = t
   | Include (Located FilePath)          -- ^ @include File@
   | DParameterType (ParameterType name) -- ^ @parameter type T : #@
@@ -178,11 +185,25 @@ data ImportSpec = Hiding [Ident]
                 | Only   [Ident]
                   deriving (Eq, Show, Generic, NFData)
 
-data TySyn n  = TySyn (Located n) [TParam n] (Type n)
+-- The 'Maybe Fixity' field is filled in by the NoPat pass.
+data TySyn n = TySyn (Located n) (Maybe Fixity) [TParam n] (Type n)
                 deriving (Eq, Show, Generic, NFData, Functor)
 
-data PropSyn n = PropSyn (Located n) [TParam n] [Prop n]
+-- The 'Maybe Fixity' field is filled in by the NoPat pass.
+data PropSyn n = PropSyn (Located n) (Maybe Fixity) [TParam n] [Prop n]
                  deriving (Eq, Show, Generic, NFData, Functor)
+
+tsName :: TySyn name -> Located name
+tsName (TySyn lqn _ _ _) = lqn
+
+psName :: PropSyn name -> Located name
+psName (PropSyn lqn _ _ _) = lqn
+
+tsFixity :: TySyn name -> Maybe Fixity
+tsFixity (TySyn _ f _ _) = f
+
+psFixity :: PropSyn name -> Maybe Fixity
+psFixity (PropSyn _ f _ _) = f
 
 {- | Bindings.  Notes:
 
@@ -223,6 +244,15 @@ data Newtype name = Newtype { nName   :: Located name        -- ^ Type name
                             , nBody   :: [Named (Type name)] -- ^ Constructor
                             } deriving (Eq, Show, Generic, NFData)
 
+-- | A declaration for a type with no implementation.
+data PrimType name = PrimType { primTName :: Located name
+                              , primTKind :: Located Kind
+                              , primTCts  :: ([TParam name], [Prop name])
+                                -- ^ parameters are in the order used
+                                -- by the type constructor.
+                              , primTFixity :: Maybe Fixity
+                              } deriving (Show,Generic,NFData)
+
 -- | Input at the REPL, which can either be an expression or a @let@
 -- statement.
 data ReplInput name = ExprInput (Expr name)
@@ -260,11 +290,14 @@ data Expr n   = EVar n                          -- ^ @ x @
               | ELit Literal                    -- ^ @ 0x10 @
               | ENeg (Expr n)                   -- ^ @ -1 @
               | EComplement (Expr n)            -- ^ @ ~1 @
+              | EGenerate (Expr n)              -- ^ @ generate f @
               | ETuple [Expr n]                 -- ^ @ (1,2,3) @
               | ERecord [Named (Expr n)]        -- ^ @ { x = 1, y = 2 } @
               | ESel (Expr n) Selector          -- ^ @ e.l @
+              | EUpd (Maybe (Expr n)) [ UpdField n ]  -- ^ @ { r | x = e } @
               | EList [Expr n]                  -- ^ @ [1,2,3] @
-              | EFromTo (Type n) (Maybe (Type n)) (Maybe (Type n)) -- ^ @[1, 5 ..  117 ] @
+              | EFromTo (Type n) (Maybe (Type n)) (Type n) (Maybe (Type n))
+                                                -- ^ @ [1, 5 .. 117 : t] @
               | EInfFrom (Expr n) (Maybe (Expr n))-- ^ @ [1, 3 ...] @
               | EComp (Expr n) [[Match n]]      -- ^ @ [ 1 | x <- xs ] @
               | EApp (Expr n) (Expr n)          -- ^ @ f x @
@@ -276,9 +309,17 @@ data Expr n   = EVar n                          -- ^ @ x @
               | EFun [Pattern n] (Expr n)       -- ^ @ \\x y -> x @
               | ELocated (Expr n) Range         -- ^ position annotation
 
+              | ESplit (Expr n)                 -- ^ @ splitAt x @ (Introduced by NoPat)
               | EParens (Expr n)                -- ^ @ (e)   @ (Removed by Fixity)
               | EInfix (Expr n) (Located n) Fixity (Expr n)-- ^ @ a + b @ (Removed by Fixity)
                 deriving (Eq, Show, Generic, NFData, Functor)
+
+data UpdField n = UpdField UpdHow [Located Selector] (Expr n)
+                                                -- ^ non-empty list @ x.y = e@
+                deriving (Eq, Show, Generic, NFData, Functor)
+
+data UpdHow     = UpdSet | UpdFun   -- ^ Are we setting or updating a field.
+                deriving (Eq, Show, Generic, NFData)
 
 data TypeInst name = NamedInst (Named (Type name))
                    | PosInst (Type name)
@@ -304,7 +345,7 @@ data Named a = Named { name :: Located Ident, value :: a }
 data Schema n = Forall [TParam n] [Prop n] (Type n) (Maybe Range)
   deriving (Eq, Show, Generic, NFData, Functor)
 
-data Kind = KNum | KType | KFun Kind Kind
+data Kind = KProp | KNum | KType | KFun Kind Kind
   deriving (Eq, Show, Generic, NFData)
 
 data TParam n = TParam { tpName  :: n
@@ -319,16 +360,6 @@ data Type n = TFun (Type n) (Type n)  -- ^ @[8] -> [8]@
             | TNum Integer            -- ^ @10@
             | TChar Char              -- ^ @'a'@
             | TUser n [Type n]        -- ^ A type variable or synonym
-
-            | TApp TCon [Type n]
-              -- ^ @2 + x@
-              -- Note that the parser never produces these; instead it
-              -- produces a "TUser" value.  The "TApp" is introduced by
-              -- the renamer when it spots built-in functions.
-              -- XXX: We should just add primitive declarations for the
-              -- built-in type functions, and simplify all this.
-
-
             | TRecord [Named (Type n)]-- ^ @{ x : [8], y : [32] }@
             | TTuple [Type n]         -- ^ @([8], [32])@
             | TWild                   -- ^ @_@, just some type.
@@ -337,21 +368,9 @@ data Type n = TFun (Type n) (Type n)  -- ^ @[8] -> [8]@
             | TInfix (Type n) (Located n) Fixity (Type n) -- ^ @ ty + ty @
               deriving (Eq, Show, Generic, NFData, Functor)
 
-
-data Prop n   = CFin (Type n)             -- ^ @ fin x   @
-              | CEqual (Type n) (Type n)  -- ^ @ x == 10 @
-              | CNeq (Type n) (Type n)    -- ^ @ x != 10 @
-              | CGeq (Type n) (Type n)    -- ^ @ x >= 10 @
-              | CZero (Type n)            -- ^ @ Zero a  @
-              | CLogic (Type n)           -- ^ @ Logic a @
-              | CArith (Type n)           -- ^ @ Arith a @
-              | CCmp (Type n)             -- ^ @ Cmp a @
-              | CSignedCmp (Type n)       -- ^ @ SignedCmp a @
-              | CLiteral (Type n) (Type n)-- ^ @ Literal val a @
-              | CUser n [Type n]          -- ^ Constraint synonym
-              | CLocated (Prop n) Range   -- ^ Location information
-              | CType (Type n)            -- ^ After parsing
-                deriving (Eq, Show, Generic, NFData, Functor)
+-- | A 'Prop' is a 'Type' that represents a type constraint.
+newtype Prop n = CType (Type n)
+  deriving (Eq, Show, Generic, NFData, Functor)
 
 
 --------------------------------------------------------------------------------
@@ -384,16 +403,6 @@ instance AddLoc (Type name) where
   addLoc = TLocated
 
   dropLoc (TLocated e _) = dropLoc e
-  dropLoc e              = e
-
-instance HasLoc (Prop name) where
-  getLoc (CLocated _ r) = Just r
-  getLoc _              = Nothing
-
-instance AddLoc (Prop name) where
-  addLoc = CLocated
-
-  dropLoc (CLocated e _) = dropLoc e
   dropLoc e              = e
 
 instance AddLoc (Pattern name) where
@@ -441,11 +450,15 @@ instance HasLoc a => HasLoc (TopLevel a) where
 instance HasLoc (TopDecl name) where
   getLoc td = case td of
     Decl tld    -> getLoc tld
+    DPrimType pt -> getLoc pt
     TDNewtype n -> getLoc n
     Include lfp -> getLoc lfp
     DParameterType d -> getLoc d
     DParameterFun d  -> getLoc d
     DParameterConstraint d -> getLoc d
+
+instance HasLoc (PrimType name) where
+  getLoc pt = Just (rComb (srcRange (primTName pt)) (srcRange (primTKind pt)))
 
 instance HasLoc (ParameterType name) where
   getLoc a = getLoc (ptName a)
@@ -500,6 +513,7 @@ instance (Show name, PPName name) => PP (TopDecl name) where
   ppPrec _ top_decl =
     case top_decl of
       Decl    d   -> pp d
+      DPrimType p -> pp p
       TDNewtype n -> pp n
       Include l   -> text "include" <+> text (show (thing l))
       DParameterFun d -> pp d
@@ -510,6 +524,10 @@ instance (Show name, PPName name) => PP (TopDecl name) where
                        [x] -> x
                        []  -> "()"
                        xs  -> parens (hsep (punctuate comma xs))
+
+instance (Show name, PPName name) => PP (PrimType name) where
+  ppPrec _ pt =
+    "primitive" <+> "type" <+> pp (primTName pt) <+> ":" <+> pp (primTKind pt)
 
 instance (Show name, PPName name) => PP (ParameterType name) where
   ppPrec _ a = text "parameter" <+> text "type" <+>
@@ -592,11 +610,12 @@ instance (Show name, PPName name) => PP (BindDef name) where
 
 
 instance PPName name => PP (TySyn name) where
-  ppPrec _ (TySyn x xs t) = text "type" <+> ppL x <+> fsep (map (ppPrec 1) xs)
-                                        <+> text "=" <+> pp t
+  ppPrec _ (TySyn x _ xs t) =
+    text "type" <+> ppL x <+> fsep (map (ppPrec 1) xs)
+                <+> text "=" <+> pp t
 
 instance PPName name => PP (PropSyn name) where
-  ppPrec _ (PropSyn x xs ps) =
+  ppPrec _ (PropSyn x _ xs ps) =
     text "constraint" <+> ppL x <+> fsep (map (ppPrec 1) xs)
                       <+> text "=" <+> parens (commaSep (map pp ps))
 
@@ -673,17 +692,21 @@ instance (Show name, PPName name) => PP (Expr name) where
 
       ENeg x        -> wrap n 3 (text "-" <.> ppPrec 4 x)
       EComplement x -> wrap n 3 (text "~" <.> ppPrec 4 x)
+      EGenerate x   -> wrap n 3 (text "generate" <+> ppPrec 4 x)
 
       ETuple es     -> parens (commaSep (map pp es))
       ERecord fs    -> braces (commaSep (map (ppNamed "=") fs))
       EList es      -> brackets (commaSep (map pp es))
-      EFromTo e1 e2 e3 -> brackets (pp e1 <.> step <+> text ".." <+> end)
+      EFromTo e1 e2 e3 t1 -> brackets (pp e1 <.> step <+> text ".." <+> end)
         where step = maybe empty (\e -> comma <+> pp e) e2
-              end  = maybe empty pp e3
+              end = maybe (pp e3) (\t -> pp e3 <+> colon <+> pp t) t1
       EInfFrom e1 e2 -> brackets (pp e1 <.> step <+> text "...")
         where step = maybe empty (\e -> comma <+> pp e) e2
       EComp e mss   -> brackets (pp e <+> vcat (map arm mss))
         where arm ms = text "|" <+> commaSep (map pp ms)
+      EUpd mb fs    -> braces (hd <+> "|" <+> commaSep (map pp fs))
+        where hd = maybe "_" pp mb
+
       ETypeVal t    -> text "`" <.> ppPrec 5 t     -- XXX
       EAppT e ts    -> ppPrec 4 e <.> text "`" <.> braces (commaSep (map pp ts))
       ESel    e l   -> ppPrec 4 e <.> text "." <.> pp l
@@ -713,6 +736,8 @@ instance (Show name, PPName name) => PP (Expr name) where
 
       ELocated e _  -> ppPrec n e
 
+      ESplit e      -> wrap n 3 (text "splitAt" <+> ppPrec 4 e)
+
       EParens e -> parens (pp e)
 
       EInfix e1 op _ e2 -> wrap n 0 (pp e1 <+> ppInfixName (thing op) <+> pp e2)
@@ -722,6 +747,13 @@ instance (Show name, PPName name) => PP (Expr name) where
      return Infix { .. }
    isInfix _ = Nothing
 
+instance (Show name, PPName name) => PP (UpdField name) where
+  ppPrec _ (UpdField h xs e) = ppNestedSels (map thing xs) <+> pp h <+> pp e
+
+instance PP UpdHow where
+  ppPrec _ h = case h of
+                 UpdSet -> "="
+                 UpdFun -> "->"
 
 instance PPName name => PP (Pattern name) where
   ppPrec n pat =
@@ -752,22 +784,24 @@ instance PPName name => PP (Schema name) where
 instance PP Kind where
   ppPrec _ KType  = text "*"
   ppPrec _ KNum   = text "#"
+  ppPrec _ KProp  = text "@"
   ppPrec n (KFun k1 k2) = wrap n 1 (ppPrec 1 k1 <+> "->" <+> ppPrec 0 k2)
 
 -- | "Conversational" printing of kinds (e.g., to use in error messages)
 cppKind :: Kind -> Doc
 cppKind KType     = text "a value type"
 cppKind KNum      = text "a numeric type"
+cppKind KProp     = text "a constraint type"
 cppKind (KFun {}) = text "a type-constructor type"
 
 instance PPName name => PP (TParam name) where
   ppPrec n (TParam p Nothing _)   = ppPrec n p
   ppPrec n (TParam p (Just k) _)  = wrap n 1 (pp p <+> text ":" <+> pp k)
 
--- 4: wrap [_] t
--- 3: wrap application
--- 2: wrap function
--- 1:
+-- 4: atomic type expression
+-- 3: [_]t or application
+-- 2: infix type
+-- 1: function type
 instance PPName name => PP (Type name) where
   ppPrec n ty =
     case ty of
@@ -781,16 +815,9 @@ instance PPName name => PP (Type name) where
       TSeq t1 t2     -> optParens (n > 3)
                       $ brackets (pp t1) <.> ppPrec 3 t2
 
-      _ | Just tinf <- isInfix ty ->
-              optParens (n > 2)
-              $ ppInfix 2 isInfix tinf
-
-      TApp f ts      -> optParens (n > 2)
-                      $ pp f <+> fsep (map (ppPrec 4) ts)
-
       TUser f []     -> ppPrefixName f
 
-      TUser f ts     -> optParens (n > 2)
+      TUser f ts     -> optParens (n > 3)
                       $ ppPrefixName f <+> fsep (map (ppPrec 4) ts)
 
       TFun t1 t2     -> optParens (n > 1)
@@ -800,32 +827,12 @@ instance PPName name => PP (Type name) where
 
       TParens t      -> parens (pp t)
 
-      TInfix t1 o _ t2 -> optParens (n > 0)
-                        $ sep [ppPrec 2 t1 <+> ppInfixName o, ppPrec 1 t2]
+      TInfix t1 o _ t2 -> optParens (n > 2)
+                        $ sep [ppPrec 2 t1 <+> ppInfixName o, ppPrec 3 t2]
 
-   where
-   isInfix (TApp ieOp [ieLeft, ieRight]) = do
-     (ieAssoc,iePrec) <- ppNameFixity ieOp
-     return Infix { .. }
-   isInfix _ = Nothing
 
 instance PPName name => PP (Prop name) where
-  ppPrec n prop =
-    case prop of
-      CFin t         -> text "fin"   <+> ppPrec 4 t
-      CZero t        -> text "Zero"  <+> ppPrec 4 t
-      CLogic t       -> text "Logic" <+> ppPrec 4 t
-      CArith t       -> text "Arith" <+> ppPrec 4 t
-      CCmp t         -> text "Cmp"   <+> ppPrec 4 t
-      CSignedCmp t   -> text "SignedCmp" <+> ppPrec 4 t
-      CLiteral t1 t2 -> text "Literal" <+> ppPrec 4 t1 <+> ppPrec 4 t2
-      CEqual t1 t2   -> ppPrec 2 t1 <+> text "==" <+> ppPrec 2 t2
-      CNeq t1 t2     -> ppPrec 2 t1 <+> text "!=" <+> ppPrec 2 t2
-      CGeq t1 t2     -> ppPrec 2 t1 <+> text ">=" <+> ppPrec 2 t2
-      CUser f ts     -> optParens (n > 2)
-                      $ ppPrefixName f <+> fsep (map (ppPrec 4) ts)
-      CLocated c _   -> ppPrec n c
-      CType t        -> ppPrec n t
+  ppPrec n (CType t) = ppPrec n t
 
 
 --------------------------------------------------------------------------------
@@ -859,11 +866,15 @@ instance NoPos (TopDecl name) where
   noPos decl =
     case decl of
       Decl    x   -> Decl     (noPos x)
+      DPrimType t -> DPrimType (noPos t)
       TDNewtype n -> TDNewtype(noPos n)
       Include x   -> Include  (noPos x)
       DParameterFun d  -> DParameterFun (noPos d)
       DParameterType d -> DParameterType (noPos d)
       DParameterConstraint d -> DParameterConstraint (noPos d)
+
+instance NoPos (PrimType name) where
+  noPos x = x
 
 instance NoPos (ParameterType name) where
   noPos a = a
@@ -911,36 +922,42 @@ instance NoPos Pragma where
 
 
 instance NoPos (TySyn name) where
-  noPos (TySyn x y z) = TySyn (noPos x) (noPos y) (noPos z)
+  noPos (TySyn x f y z) = TySyn (noPos x) f (noPos y) (noPos z)
 
 instance NoPos (PropSyn name) where
-  noPos (PropSyn x y z) = PropSyn (noPos x) (noPos y) (noPos z)
+  noPos (PropSyn x f y z) = PropSyn (noPos x) f (noPos y) (noPos z)
 
 instance NoPos (Expr name) where
   noPos expr =
     case expr of
-      EVar x        -> EVar     x
-      ELit x        -> ELit     x
-      ENeg x        -> ENeg     (noPos x)
-      EComplement x -> EComplement (noPos x)
-      ETuple x      -> ETuple   (noPos x)
-      ERecord x     -> ERecord  (noPos x)
-      ESel x y      -> ESel     (noPos x) y
-      EList x       -> EList    (noPos x)
-      EFromTo x y z -> EFromTo  (noPos x) (noPos y) (noPos z)
-      EInfFrom x y  -> EInfFrom (noPos x) (noPos y)
-      EComp x y     -> EComp    (noPos x) (noPos y)
-      EApp  x y     -> EApp     (noPos x) (noPos y)
-      EAppT x y     -> EAppT    (noPos x) (noPos y)
-      EIf   x y z   -> EIf      (noPos x) (noPos y) (noPos z)
-      EWhere x y    -> EWhere   (noPos x) (noPos y)
-      ETyped x y    -> ETyped   (noPos x) (noPos y)
-      ETypeVal x    -> ETypeVal (noPos x)
-      EFun x y      -> EFun     (noPos x) (noPos y)
-      ELocated x _  -> noPos x
+      EVar x          -> EVar     x
+      ELit x          -> ELit     x
+      ENeg x          -> ENeg     (noPos x)
+      EComplement x   -> EComplement (noPos x)
+      EGenerate x     -> EGenerate (noPos x)
+      ETuple x        -> ETuple   (noPos x)
+      ERecord x       -> ERecord  (noPos x)
+      ESel x y        -> ESel     (noPos x) y
+      EUpd x y        -> EUpd     (noPos x) (noPos y)
+      EList x         -> EList    (noPos x)
+      EFromTo x y z t -> EFromTo  (noPos x) (noPos y) (noPos z) (noPos t)
+      EInfFrom x y    -> EInfFrom (noPos x) (noPos y)
+      EComp x y       -> EComp    (noPos x) (noPos y)
+      EApp  x y       -> EApp     (noPos x) (noPos y)
+      EAppT x y       -> EAppT    (noPos x) (noPos y)
+      EIf   x y z     -> EIf      (noPos x) (noPos y) (noPos z)
+      EWhere x y      -> EWhere   (noPos x) (noPos y)
+      ETyped x y      -> ETyped   (noPos x) (noPos y)
+      ETypeVal x      -> ETypeVal (noPos x)
+      EFun x y        -> EFun     (noPos x) (noPos y)
+      ELocated x _    -> noPos x
 
-      EParens e     -> EParens (noPos e)
-      EInfix x y f z-> EInfix (noPos x) y f (noPos z)
+      ESplit x        -> ESplit (noPos x)
+      EParens e       -> EParens (noPos e)
+      EInfix x y f z  -> EInfix (noPos x) y f (noPos z)
+
+instance NoPos (UpdField name) where
+  noPos (UpdField h xs e) = UpdField h xs (noPos e)
 
 instance NoPos (TypeInst name) where
   noPos (PosInst ts)   = PosInst (noPos ts)
@@ -972,7 +989,6 @@ instance NoPos (Type name) where
   noPos ty =
     case ty of
       TWild         -> TWild
-      TApp x y      -> TApp     x         (noPos y)
       TUser x y     -> TUser    x         (noPos y)
       TRecord x     -> TRecord  (noPos x)
       TTuple x      -> TTuple   (noPos x)
@@ -986,18 +1002,4 @@ instance NoPos (Type name) where
       TInfix x y f z-> TInfix (noPos x) y f (noPos z)
 
 instance NoPos (Prop name) where
-  noPos prop =
-    case prop of
-      CEqual  x y   -> CEqual  (noPos x) (noPos y)
-      CNeq x y      -> CNeq (noPos x) (noPos y)
-      CGeq x y      -> CGeq (noPos x) (noPos y)
-      CFin x        -> CFin (noPos x)
-      CZero x       -> CZero  (noPos x)
-      CLogic x      -> CLogic (noPos x)
-      CArith x      -> CArith (noPos x)
-      CCmp x        -> CCmp   (noPos x)
-      CSignedCmp x  -> CSignedCmp (noPos x)
-      CLiteral x y  -> CLiteral (noPos x) (noPos y)
-      CUser x y     -> CUser x (noPos y)
-      CLocated c _  -> noPos c
-      CType t       -> CType (noPos t)
+  noPos (CType t) = CType (noPos t)

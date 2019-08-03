@@ -166,17 +166,15 @@
 (declare-fun cryWidthUnknown (Int) Int)
 
 ; Some axioms about cryWidthUnknown
+(define-fun k_2_to_64 () Int 18446744073709551616)
+(define-fun k_2_to_65 () Int 36893488147419103232)
 
-(assert (forall ((x Int)) (or (> (cryWidthUnknown x) 64)
-                              (< x 18446744073709551616))))
+(assert (forall ((x Int)) (or (> (cryWidthUnknown x) 64) (< x k_2_to_64))))
+(assert (forall ((x Int)) (or (> x (cryWidthUnknown x))  (< x k_2_to_64))))
 
 ; This helps the #548 property
-(assert (forall ((x Int)) (or (>= 65 (cryWidthUnknown x))
-                              (>= x 36893488147419103232))))
+(assert (forall ((x Int)) (or (>= 65 (cryWidthUnknown x)) (>= x k_2_to_65))))
 
-
-(assert (forall ((x Int)) (or (> x (cryWidthUnknown x))
-                              (< x 18446744073709551616))))
 
 (assert (forall ((x Int) (y Int))
   (=> (>= x y)
@@ -184,12 +182,12 @@
 
 
 ; this helps #548.  It seems to be quite slow, however.
-(assert (forall ((x Int) (y Int))
-  (=>
-    (>  y (cryWidthUnknown x))
-    (>= y (cryWidthUnknown (* 2 x)))
-  )
-))
+; (assert (forall ((x Int) (y Int))
+;   (=>
+;     (>  y (cryWidthUnknown x))
+;     (>= y (cryWidthUnknown (* 2 x)))
+;   )
+; ))
 
 
 
@@ -318,21 +316,28 @@
 )
 
 
-(define-fun cryLenFromThen ((x InfNat) (y InfNat) (z InfNat)) InfNat
-  (ite (or (isErr x) (not (isFin x))
-           (isErr y) (not (isFin y))
-           (isErr z) (not (isFin z))
-           (= (value x) (value y))) cryErr
-  (ite (< (value y) (value x)) (cryLenFromThenTo x y (cryNat 0))
-       (cryLenFromThenTo x y (cryNat (- (cryExpTable 2 (value z)) 1))))
-  )
-)
-
-
 ; ---
-; (declare-fun kv0 () InfNat )
-; (assert (cryVar kv0 ) )
-; (assert (not (isFin kv0)))
-; (assert (ite (isFin kv0) (>= (value kv0) 5) true))
-; (check-sat )
+
+
+; (declare-fun L () InfNat)
+; (declare-fun w () InfNat)
+; 
+; (assert (cryVar L))
+; (assert (cryVar w))
+; 
+; (assert (cryAssume (cryFin w)))
+; (assert (cryAssume (cryGeq w (cryNat 1))))
+; (assert (cryAssume (cryGeq (cryMul (cryNat 2) w) (cryWidth L))))
+; 
+; (assert (cryProve
+;   (cryGeq
+;     (cryMul
+;       (cryCeilDiv
+;         (cryAdd (cryNat 1) (cryAdd L (cryMul (cryNat 2) w)))
+;         (cryMul (cryNat 16) w))
+;       (cryMul (cryNat 16) w))
+;     (cryAdd (cryNat 1) (cryAdd L (cryMul (cryNat 2) w))))))
+; 
+; (check-sat)
+
 

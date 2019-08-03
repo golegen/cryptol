@@ -96,7 +96,7 @@ noPat pat =
          x <- newName
          r <- getRange
          let len      = length ps
-             ty       = TSeq (TNum (fromIntegral len)) TWild
+             ty       = TSeq (TNum (toInteger len)) TWild
              getN a n = sel a x (ListSel n (Just len))
          return (pTy r x ty, zipWith getN as [0..] ++ concat dss)
 
@@ -113,15 +113,14 @@ noPat pat =
       do (a,ds) <- noPat p
          return (PTyped a t, ds)
 
-    -- XXX: Ww can do more with type annotations here
+    -- XXX: We can do more with type annotations here
     PSplit p1 p2 ->
       do (a1,ds1) <- noPat p1
          (a2,ds2) <- noPat p2
          x <- newName
          tmp <- newName
          r <- getRange
-         let prim = EVar (mkUnqual (mkIdent "splitAt"))
-             bTmp = simpleBind (Located r tmp) (EApp prim (EVar x))
+         let bTmp = simpleBind (Located r tmp) (ESplit (EVar x))
              b1   = sel a1 tmp (TupleSel 0 (Just 2))
              b2   = sel a2 tmp (TupleSel 1 (Just 2))
          return (pVar r x, bTmp : b1 : b2 : ds1 ++ ds2)
@@ -149,9 +148,11 @@ noPatE expr =
     ELit {}       -> return expr
     ENeg e        -> ENeg    <$> noPatE e
     EComplement e -> EComplement <$> noPatE e
+    EGenerate e   -> EGenerate <$> noPatE e
     ETuple es     -> ETuple  <$> mapM noPatE es
     ERecord es    -> ERecord <$> mapM noPatF es
     ESel e s      -> ESel    <$> noPatE e <*> return s
+    EUpd mb fs    -> EUpd    <$> traverse noPatE mb <*> traverse noPatUF fs
     EList es      -> EList   <$> mapM noPatE es
     EFromTo {}    -> return expr
     EInfFrom e e' -> EInfFrom <$> noPatE e <*> traverse noPatE e'
@@ -166,11 +167,15 @@ noPatE expr =
                         return (EFun ps1 e1)
     ELocated e r1 -> ELocated <$> inRange r1 (noPatE e) <*> return r1
 
+    ESplit e      -> ESplit  <$> noPatE e
     EParens e     -> EParens <$> noPatE e
     EInfix x y f z-> EInfix  <$> noPatE x <*> pure y <*> pure f <*> noPatE z
 
   where noPatF x = do e <- noPatE (value x)
                       return x { value = e }
+
+noPatUF :: UpdField PName -> NoPatM (UpdField PName)
+noPatUF (UpdField h ls e) = UpdField h ls <$> noPatE e
 
 noPatFun :: [Pattern PName] -> Expr PName -> NoPatM ([Pattern PName], Expr PName)
 noPatFun ps e =
@@ -237,21 +242,28 @@ noMatchD decl =
 noPatDs :: [Decl PName] -> NoPatM [Decl PName]
 noPatDs ds =
   do ds1 <- concat <$> mapM noMatchD ds
-     let pragmaMap = Map.fromListWith (++) $ concatMap toPragma ds1
-         sigMap    = Map.fromListWith (++) $ concatMap toSig ds1
-         fixMap    = Map.fromListWith (++) $ concatMap toFixity ds1
-     (ds2, (pMap,sMap,fMap,_)) <- runStateT (pragmaMap, sigMap, fixMap, Map.empty)
-                                            (annotDs ds1)
+     let fixes = Map.fromListWith (++) $ concatMap toFixity ds1
+         amap = AnnotMap
+           { annPragmas = Map.fromListWith (++) $ concatMap toPragma ds1
+           , annSigs    = Map.fromListWith (++) $ concatMap toSig ds1
+           , annValueFs = fixes
+           , annTypeFs  = fixes
+           , annDocs    = Map.empty
+           }
 
-     forM_ (Map.toList pMap) $ \(n,ps) ->
+     (ds2, AnnotMap { .. }) <- runStateT amap (annotDs ds1)
+
+     forM_ (Map.toList annPragmas) $ \(n,ps) ->
        forM_ ps $ \p -> recordError $ PragmaNoBind (p { thing = n }) (thing p)
 
-     forM_ (Map.toList sMap) $ \(n,ss) ->
+     forM_ (Map.toList annSigs) $ \(n,ss) ->
        do _ <- checkSigs n ss
           forM_ ss $ \s -> recordError $ SignatureNoBind (s { thing = n })
                                                          (thing s)
 
-     forM_ (Map.toList fMap) $ \(n,fs) ->
+     -- Generate an error if a fixity declaration is not used for
+     -- either a value-level or type-level operator.
+     forM_ (Map.toList (Map.intersection annValueFs annTypeFs)) $ \(n,fs) ->
        forM_ fs $ \f -> recordError $ FixityNoBind f { thing = n }
 
      return ds2
@@ -263,23 +275,29 @@ noPatTopDs tds =
   do desugared <- concat <$> mapM desugar tds
 
      let allDecls  = map tlValue (decls desugared)
-         pragmaMap = Map.fromListWith (++) $ concatMap toPragma allDecls
-         sigMap    = Map.fromListWith (++) $ concatMap toSig    allDecls
-         fixMap    = Map.fromListWith (++) $ concatMap toFixity allDecls
-         docMap    = Map.fromListWith (++) $ concatMap toDocs   (decls tds)
+         fixes     = Map.fromListWith (++) $ concatMap toFixity allDecls
 
-     (tds', (pMap,sMap,fMap,_)) <- runStateT (pragmaMap,sigMap,fixMap,docMap)
-                                             (annotTopDs desugared)
+     let ann = AnnotMap
+           { annPragmas = Map.fromListWith (++) $ concatMap toPragma allDecls
+           , annSigs    = Map.fromListWith (++) $ concatMap toSig    allDecls
+           , annValueFs = fixes
+           , annTypeFs  = fixes
+           , annDocs    = Map.fromListWith (++) $ concatMap toDocs $ decls tds
+          }
 
-     forM_ (Map.toList pMap) $ \(n,ps) ->
+     (tds', AnnotMap { .. }) <- runStateT ann (annotTopDs desugared)
+
+     forM_ (Map.toList annPragmas) $ \(n,ps) ->
        forM_ ps $ \p -> recordError $ PragmaNoBind (p { thing = n }) (thing p)
 
-     forM_ (Map.toList sMap) $ \(n,ss) ->
+     forM_ (Map.toList annSigs) $ \(n,ss) ->
        do _ <- checkSigs n ss
           forM_ ss $ \s -> recordError $ SignatureNoBind (s { thing = n })
                                                          (thing s)
 
-     forM_ (Map.toList fMap) $ \(n,fs) ->
+     -- Generate an error if a fixity declaration is not used for
+     -- either a value-level or type-level operator.
+     forM_ (Map.toList (Map.intersection annValueFs annTypeFs)) $ \(n,fs) ->
        forM_ fs $ \f -> recordError $ FixityNoBind f { thing = n }
 
      return tds'
@@ -304,11 +322,15 @@ noPatModule m =
 
 --------------------------------------------------------------------------------
 
-type AnnotMap = ( Map.Map PName [Located  Pragma       ]
-                , Map.Map PName [Located (Schema PName)]
-                , Map.Map PName [Located  Fixity       ]
-                , Map.Map PName [Located  String       ]
-                )
+data AnnotMap = AnnotMap
+  { annPragmas  :: Map.Map PName [Located  Pragma       ]
+  , annSigs     :: Map.Map PName [Located (Schema PName)]
+  , annValueFs  :: Map.Map PName [Located  Fixity       ]
+  , annTypeFs   :: Map.Map PName [Located  Fixity       ]
+  , annDocs     :: Map.Map PName [Located  String       ]
+  }
+
+type Annotates a = a -> StateT AnnotMap NoPatM a
 
 -- | Add annotations to exported declaration groups.
 --
@@ -316,7 +338,7 @@ type AnnotMap = ( Map.Map PName [Located  Pragma       ]
 -- export specifications, this will favor the specification of the binding.
 -- This is most likely the intended behavior, so it's probably fine, but it does
 -- smell a bit.
-annotTopDs :: [TopDecl PName] -> StateT AnnotMap NoPatM [TopDecl PName]
+annotTopDs :: Annotates [TopDecl PName]
 annotTopDs tds =
   case tds of
 
@@ -328,18 +350,26 @@ annotTopDs tds =
                Left _   -> annotTopDs ds
                Right d2 -> (Decl (d1 { tlValue = d2 }) :) <$> annotTopDs ds
 
-        -- XXX: Add fixity once we support type-level fixities
-        DParameterType {} -> (d :) <$> annotTopDs ds
+        DPrimType tl ->
+          do pt <- annotPrimType (tlValue tl)
+             let d1 = DPrimType tl { tlValue = pt }
+             (d1 :) <$> annotTopDs ds
+
+        DParameterType p ->
+          do p1 <- annotParameterType p
+             (DParameterType p1 :) <$> annotTopDs ds
+
         DParameterConstraint {} -> (d :) <$> annotTopDs ds
+
         DParameterFun p ->
-          do (ps,ss,fs,ds') <- get
+          do AnnotMap { .. } <- get
              let rm _ _ = Nothing
                  name = thing (pfName p)
-             case Map.updateLookupWithKey rm name fs of
+             case Map.updateLookupWithKey rm name annValueFs of
                (Nothing,_)  -> (d :) <$> annotTopDs ds
                (Just f,fs1) ->
                  do mbF <- lift (checkFixs name f)
-                    set (ps,ss,fs1,ds')
+                    set AnnotMap { annValueFs = fs1, .. }
                     let p1 = p { pfFixity = mbF }
                     (DParameterFun p1 :) <$> annotTopDs ds
 
@@ -350,8 +380,8 @@ annotTopDs tds =
     [] -> return []
 
 
--- | Add annotations, keeping track of which annotation are not yet used up.
-annotDs :: [Decl PName] -> StateT AnnotMap NoPatM [Decl PName]
+-- | Add annotations, keeping track of which annotations are not yet used up.
+annotDs :: Annotates [Decl PName]
 annotDs (d : ds) =
   do ignore <- runExceptionT (annotD d)
      case ignore of
@@ -359,7 +389,7 @@ annotDs (d : ds) =
        Right d1  -> (d1 :) <$> annotDs ds
 annotDs [] = return []
 
--- | Add annotations, keeping track of which annotation are not yet used up.
+-- | Add annotations, keeping track of which annotations are not yet used up.
 -- The exception indicates which declarations are no longer needed.
 annotD :: Decl PName -> ExceptionT () (StateT AnnotMap NoPatM) (Decl PName)
 annotD decl =
@@ -369,33 +399,73 @@ annotD decl =
     DFixity{}     -> raise ()
     DPragma {}    -> raise ()
     DPatBind {}   -> raise ()
-    DType {}      -> return decl
-    DProp {}      -> return decl
+    DType tysyn   -> DType <$> lift (annotTySyn tysyn)
+    DProp propsyn -> DProp <$> lift (annotPropSyn propsyn)
     DLocated d r  -> (`DLocated` r) <$> annotD d
 
 -- | Add pragma/signature annotations to a binding.
-annotB :: Bind PName -> StateT AnnotMap NoPatM (Bind PName)
+annotB :: Annotates (Bind PName)
 annotB Bind { .. } =
-  do (ps,ss,fs,ds) <- get
+  do AnnotMap { .. } <- get
      let name       = thing bName
          remove _ _ = Nothing
-     case ( Map.updateLookupWithKey remove name ps
-          , Map.updateLookupWithKey remove name ss
-          , Map.updateLookupWithKey remove name fs
-          , Map.updateLookupWithKey remove name ds
-          ) of
-           ( (thisPs, pragmas1), (thisSigs, sigs1), (thisFixes, fixes1), (thisDocs, docs1)) ->
-                do s <- lift $ checkSigs name (jn thisSigs)
-                   f <- lift $ checkFixs name (jn thisFixes)
-                   d <- lift $ checkDocs name (jn thisDocs)
-                   set (pragmas1,sigs1,fixes1,docs1)
-                   return Bind { bSignature = s
-                               , bPragmas = map thing (jn thisPs) ++ bPragmas
-                               , bFixity = f
-                               , bDoc = d
-                               , ..
-                               }
+         (thisPs    , ps') = Map.updateLookupWithKey remove name annPragmas
+         (thisSigs  , ss') = Map.updateLookupWithKey remove name annSigs
+         (thisFixes , fs') = Map.updateLookupWithKey remove name annValueFs
+         (thisDocs  , ds') = Map.updateLookupWithKey remove name annDocs
+     s <- lift $ checkSigs name $ jn thisSigs
+     f <- lift $ checkFixs name $ jn thisFixes
+     d <- lift $ checkDocs name $ jn thisDocs
+     set AnnotMap { annPragmas = ps'
+                  , annSigs    = ss'
+                  , annValueFs = fs'
+                  , annDocs    = ds'
+                  , ..
+                  }
+     return Bind { bSignature = s
+                 , bPragmas = map thing (jn thisPs) ++ bPragmas
+                 , bFixity = f
+                 , bDoc = d
+                 , ..
+                 }
   where jn x = concat (maybeToList x)
+
+annotTyThing :: PName -> StateT AnnotMap NoPatM (Maybe Fixity)
+annotTyThing name =
+  do AnnotMap { .. } <- get
+     let remove _ _ = Nothing
+         (thisFixes, ts') = Map.updateLookupWithKey remove name annTypeFs
+     f <- lift $ checkFixs name $ concat $ maybeToList thisFixes
+     set AnnotMap { annTypeFs = ts', .. }
+     pure f
+
+
+-- | Add fixity annotations to a type synonym binding.
+annotTySyn :: Annotates (TySyn PName)
+annotTySyn (TySyn ln _ params rhs) =
+  do f <- annotTyThing (thing ln)
+     pure (TySyn ln f params rhs)
+
+-- | Add fixity annotations to a constraint synonym binding.
+annotPropSyn :: Annotates (PropSyn PName)
+annotPropSyn (PropSyn ln _ params rhs) =
+  do f <- annotTyThing (thing ln)
+     pure (PropSyn ln f params rhs)
+
+-- | Annotate a primitive type declaration.
+annotPrimType :: Annotates (PrimType PName)
+annotPrimType pt =
+  do f <- annotTyThing (thing (primTName pt))
+     pure pt { primTFixity = f }
+
+-- | Annotate a module's type parameter.
+annotParameterType :: Annotates (ParameterType PName)
+annotParameterType pt =
+  do f <- annotTyThing (thing (ptName pt))
+     pure pt { ptFixity = f }
+
+
+
 
 -- | Check for multiple signatures.
 checkSigs :: PName -> [Located (Schema PName)] -> NoPatM (Maybe (Schema PName))
@@ -513,7 +583,7 @@ instance PP Error where
       SignatureNoBind x s ->
         text "At" <+> pp (srcRange x) <.> colon <+>
         text "Type signature without a matching binding:"
-         $$ nest 2 (pp s)
+         $$ nest 2 (pp (thing x) <+> colon <+> pp s)
 
       PragmaNoBind x s ->
         text "At" <+> pp (srcRange x) <.> colon <+>

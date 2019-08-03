@@ -12,6 +12,7 @@ module Cryptol.TypeCheck.Kind
   ( checkType
   , checkSchema
   , checkNewtype
+  , checkPrimType
   , checkTySyn
   , checkPropSyn
   , checkParameterType
@@ -26,15 +27,15 @@ import           Cryptol.TypeCheck.Error
 import           Cryptol.TypeCheck.Monad hiding (withTParams)
 import           Cryptol.TypeCheck.SimpType(tRebuild)
 import           Cryptol.TypeCheck.SimpleSolver(simplify)
-import           Cryptol.TypeCheck.Solve (simplifyAllConstraints
-                                         ,wfTypeFunction,wfTC)
+import           Cryptol.TypeCheck.Solve (simplifyAllConstraints)
+import           Cryptol.TypeCheck.Subst(listSubst,apSubst)
 import           Cryptol.Utils.Panic (panic)
 
 import qualified Data.Map as Map
 import           Data.List(sortBy,groupBy)
 import           Data.Maybe(fromMaybe)
 import           Data.Function(on)
-import           Control.Monad(unless,forM)
+import           Control.Monad(unless,forM,when)
 
 
 
@@ -74,7 +75,7 @@ checkParameterType a mbDoc =
 
 -- | Check a type-synonym declaration.
 checkTySyn :: P.TySyn Name -> Maybe String -> InferM TySyn
-checkTySyn (P.TySyn x as t) mbD =
+checkTySyn (P.TySyn x _ as t) mbD =
   do ((as1,t1),gs) <- collectGoals
                     $ inRange (srcRange x)
                     $ do r <- withTParams NoWildCards tySynParam as
@@ -90,7 +91,7 @@ checkTySyn (P.TySyn x as t) mbD =
 
 -- | Check a constraint-synonym declaration.
 checkPropSyn :: P.PropSyn Name -> Maybe String -> InferM TySyn
-checkPropSyn (P.PropSyn x as ps) mbD =
+checkPropSyn (P.PropSyn x _ as ps) mbD =
   do ((as1,t1),gs) <- collectGoals
                     $ inRange (srcRange x)
                     $ do r <- withTParams NoWildCards propSynParam as
@@ -126,7 +127,17 @@ checkNewtype (P.Newtype x as fs) mbD =
                     , ntDoc = mbD
                     }
 
-
+checkPrimType :: P.PrimType Name -> Maybe String -> InferM AbstractType
+checkPrimType p mbD =
+  do let (as,cs) = P.primTCts p
+     (as',cs') <- withTParams NoWildCards (TPOther . Just) as $
+                    mapM checkProp cs
+     pure AbstractType { atName = thing (P.primTName p)
+                       , atKind = cvtK (thing (P.primTKind p))
+                       , atFixitiy = P.primTFixity p
+                       , atCtrs = (as',cs')
+                       , atDoc = mbD
+                       }
 
 checkType :: P.Type Name -> Maybe Kind -> InferM Type
 checkType t k =
@@ -211,6 +222,7 @@ withTParams allowWildCards flav xs m
 cvtK :: P.Kind -> Kind
 cvtK P.KNum  = KNum
 cvtK P.KType = KType
+cvtK P.KProp = KProp
 cvtK (P.KFun k1 k2) = cvtK k1 :-> cvtK k2
 
 
@@ -224,10 +236,11 @@ tcon tc ts0 k =
   do (ts1,k1) <- appTy ts0 (kindOf tc)
      checkKind (TCon tc ts1) k k1
 
+
 -- | Check a type application of a non built-in type or type variable.
 checkTUser ::
   Name          {- ^ The name that is being applied to some arguments. -} ->
-  [P.Type Name] {- ^ Type synonym parameters -} ->
+  [P.Type Name] {- ^ Parameters to the type -} ->
   Maybe Kind    {- ^ Expected kind -} ->
   KindM Type    {- ^ Resulting type -}
 checkTUser x ts k =
@@ -235,6 +248,7 @@ checkTUser x ts k =
   mcase kLookupTSyn       checkTySynUse $
   mcase kLookupNewtype    checkNewTypeUse $
   mcase kLookupParamType  checkModuleParamUse $
+  mcase kLookupAbstractType checkAbstractTypeUse $
   checkScopedVarUse -- none of the above, must be a scoped type variable,
                     -- if the renamer did its job correctly.
   where
@@ -244,7 +258,7 @@ checkTUser x ts k =
        ts2 <- checkParams as ts1
        let su = zip as ts2
        ps1 <- mapM (`kInstantiateT` su) (tsConstraints tysyn)
-       kNewGoals (CtPartialTypeFun (UserTyFun (tsName tysyn))) ps1
+       kNewGoals (CtPartialTypeFun (tsName tysyn)) ps1
        t1  <- kInstantiateT (tsDef tysyn) su
        checkKind (TUser x ts1 t1) k k1
 
@@ -254,10 +268,24 @@ checkTUser x ts k =
        ts2 <- checkParams (ntParams nt) ts1
        return (TCon tc ts2)
 
+  checkAbstractTypeUse absT =
+    do let tc   = abstractTypeTC absT
+       (ts1,k1) <- appTy ts (kindOf tc)
+       let (as,ps) = atCtrs absT
+       case ps of
+          [] -> pure ()   -- common case
+          _ -> do let need = length as
+                      have = length ts1
+                  when (need > have) $
+                     kRecordError (TooFewTyParams (atName absT) (need - have))
+                  let su = listSubst (map tpVar as `zip` ts1)
+                  kNewGoals (CtPartialTypeFun (atName absT)) (apSubst su <$> ps)
+       checkKind (TCon tc ts1) k k1
+
   checkParams as ts1
     | paramHave == paramNeed = return ts1
     | paramHave < paramNeed  =
-                   do kRecordError (TooFewTySynParams x (paramNeed-paramHave))
+                   do kRecordError (TooFewTyParams x (paramNeed-paramHave))
                       let src = TypeErrorPlaceHolder
                       fake <- mapM (kNewType src . kindOf . tpVar)
                                    (drop paramHave as)
@@ -344,24 +372,8 @@ doCheckType ty k =
     P.TSeq t1 t2    -> tcon (TC TCSeq)                 [t1,t2] k
     P.TBit          -> tcon (TC TCBit)                 [] k
     P.TNum n        -> tcon (TC (TCNum n))             [] k
-    P.TChar n       -> tcon (TC (TCNum $ fromIntegral $ fromEnum n)) [] k
-    P.TApp tc ts    ->
-      do it <- tcon tc ts k
+    P.TChar n       -> tcon (TC (TCNum $ toInteger $ fromEnum n)) [] k
 
-         -- Now check for additional well-formedness
-         -- constraints.
-         case it of
-           TCon (TF f) ts' ->
-              case wfTypeFunction f ts' of
-                 [] -> return ()
-                 ps -> kNewGoals (CtPartialTypeFun (BuiltInTyFun f)) ps
-           TCon (TC f) ts' ->
-              case wfTC f ts' of
-                 [] -> return ()
-                 ps -> kNewGoals (CtPartialTypeFun (BuiltInTC f)) ps
-           _ -> return ()
-
-         return it
     P.TTuple ts     -> tcon (TC (TCTuple (length ts))) ts k
 
     P.TRecord fs    -> do t1 <- TRec `fmap` mapM checkF fs
@@ -372,9 +384,7 @@ doCheckType ty k =
 
     P.TParens t     -> doCheckType t k
 
-    P.TInfix{}      -> panic "KindCheck"
-                       [ "TInfix not removed by the renamer", show ty ]
-
+    P.TInfix t x _ u-> doCheckType (P.TUser (thing x) [t, u]) k
 
   where
   checkF f = do t <- kInRange (srcRange (name f))
@@ -386,21 +396,7 @@ doCheckType ty k =
 -- | Validate a parsed proposition.
 checkProp :: P.Prop Name      -- ^ Proposition that need to be checked
           -> KindM Type       -- ^ Checked representation
-checkProp prop =
-  case prop of
-    P.CFin t1        -> tcon (PC PFin)           [t1]    (Just KProp)
-    P.CEqual t1 t2   -> tcon (PC PEqual)         [t1,t2] (Just KProp)
-    P.CNeq t1 t2     -> tcon (PC PNeq)           [t1,t2] (Just KProp)
-    P.CGeq t1 t2     -> tcon (PC PGeq)           [t1,t2] (Just KProp)
-    P.CZero t1       -> tcon (PC PZero)          [t1]    (Just KProp)
-    P.CLogic t1      -> tcon (PC PLogic)         [t1]    (Just KProp)
-    P.CArith t1      -> tcon (PC PArith)         [t1]    (Just KProp)
-    P.CCmp t1        -> tcon (PC PCmp)           [t1]    (Just KProp)
-    P.CSignedCmp t1  -> tcon (PC PSignedCmp)     [t1]    (Just KProp)
-    P.CLiteral t1 t2 -> tcon (PC PLiteral)       [t1,t2] (Just KProp)
-    P.CUser x ts     -> checkTUser x ts (Just KProp)
-    P.CLocated p r1  -> kInRange r1 (checkProp p)
-    P.CType _        -> panic "checkProp" [ "Unexpected CType", show prop ]
+checkProp (P.CType t) = doCheckType t (Just KProp)
 
 
 -- | Check that a type has the expected kind.

@@ -59,6 +59,8 @@ Examples:
     name    name1    name'    longer_name
     Name    Name2    Name''   longerName
 
+
+
 Keywords and Built-in Operators
 ===============================
 
@@ -101,12 +103,11 @@ associativity with lowest precedence operators first, and highest
 precedence last.
 
 Operator                                   Associativity
----------------                            -------------
+-----------------------------------------  -------------
   `==>`                                    right
   `\/`                                     right
   `/\`                                     right
-  `->` (types)                             right
-  `!=` `==`                                not associative
+  `==` `!=` `===` `!==`                    not associative
   `>` `<` `<=` `>=` `<$` `>$` `<=$` `>=$`  not associative
   `||`                                     right
   `^`                                      left
@@ -116,17 +117,41 @@ Operator                                   Associativity
   `+` `-`                                  left
   `*` `/` `%` `/$` `%$`                    left
   `^^`                                     right
-  `!`  `!!`  `@` `@@`                      left
+  `@`  `@@`  `!` `!!`                      left
   (unary) `-` `~`                          right
 
 Table: Operator precedences.
+
+Built-in Type-level Operators
+=============================
+
+Cryptol includes a variety of operators that allow computations on
+the numeric types used to specify the sizes of sequences.
+
+Operator     Meaning
+--------     -------------------------
+  `+`        Size addition
+  `-`        Size subtraction
+  `*`        Size multiplication
+  `/`        Size division
+  `/^`       Size ceiling division (`/` rounded up)
+  `%`        Size modulus
+  `%^`       Size ceiling modulus (`%` rounded up)
+  `^^`       Size exponentiation
+  `lg2`      Size logarithm (base 2)
+  `width`    Size width (`lg2` rounded up)
+  `max`      Size maximum
+  `min`      Size minimum
+
+Table: Type-level operators
+
 
 Numeric Literals
 ================
 
 Numeric literals may be written in binary, octal, decimal, or
-hexadecimal notation. The base of a literal is determined by its
-prefix: `0b` for binary, `0o` for octal, no special prefix for
+hexadecimal notation. The base of a literal is determined by its prefix:
+`0b` for binary, `0o` for octal, no special prefix for
 decimal, and `0x` for hexadecimal.
 
 Examples:
@@ -138,12 +163,11 @@ Examples:
     0xFE                // Hexadecimal literal
     0xfe                // Hexadecimal literal
 
-Numeric literals represent finite bit sequences (i.e., they have type
-`[n]`).  Using binary, octal, and hexadecimal notation results in bit
-sequences of a fixed length, depending on the number of digits in the
-literal.  Decimal literals are overloaded, and so the length of the
-sequence is inferred from context in which the literal is used.
-Examples:
+Numeric literals in binary, octal, or hexadecimal notation result in
+bit sequences of a fixed length (i.e., they have type `[n]` for
+some `n`). The length is determined by the base and the number
+of digits in the literal. Decimal literals are overloaded, and so the
+type is inferred from context in which the literal is used. Examples:
 
     0b1010              // : [4],   1 * number of digits
     0o1234              // : [12],  3 * number of digits
@@ -151,6 +175,74 @@ Examples:
 
     10                  // : {a}. (Literal 10 a) => a
                         // a = Integer or [n] where n >= width 10
+
+Expressions
+===========
+
+This section provides an overview of the Cryptol's expression syntax.
+
+**Calling Functions**
+
+    f 2             // call `f` with parameter `2`
+    g x y           // call `g` with two parameters: `x` and `y`
+    h (x,y)         // call `h` with one parameter,  the pair `(x,y)`
+
+
+**Prefix Operators**
+
+    -2              // call unary `-` with parameter `2`
+    - 2             // call unary `-` with parameter `2`
+    f (-2)          // call `f` with one argument: `-2`,  parens are important
+    -f 2            // call unary `-` with parameter `f 2`
+    - f 2           // call unary `-` with parameter `f 2`
+
+
+**Infix Functions**
+
+    2 + 3           // call `+` with two parameters: `2` and `3`
+    2 + 3 * 5       // call `+` with two parameters: `2` and `3 * 5`
+    (+) 2 3         // call `+` with two parameters: `2` and `3`
+    f 2 + g 3       // call `+` with two parameters: `f 2` and `g 3`
+    - 2 + - 3       // call `+` with two parameters: `-2` and `-3`
+    - f 2 + - g 3
+
+**Type Annotations**
+
+    x : Bit         // specify that `x` has type `Bit`
+    f x : Bit       // specify that `f x` has type `Bit`
+    - f x : [8]     // specify that `- f x` has type `[8]`
+    2 + 3 : [8]     // specify that `2 + 3` has type `[8]`
+    \x -> x : [8]   // type annotation is on `x`, not the function
+    if x
+      then y
+      else z : Bit  // the type annotation is on `z`, not the whole `if`
+
+
+**Local Declarations**
+
+Local declarations have the weakest precedence of all expressions.
+
+    2 + x : [T]
+      where
+      type T = 8
+      x      = 2          // `T` and `x` are in scope of `2 + x : `[T]`
+
+    if x then 1 else 2
+      where x = 2         // `x` is in scope in the whole `if`
+
+    \y -> x + y
+      where x = 2         // `y` is not in scope in the defintion of `x`
+
+
+**Block Arguments**
+
+When used as the last argument to a function call,
+`if` and lambda expressions do not need parens:
+
+    f \x -> x       // call `f` with one argument `x -> x`
+    2 + if x
+          then y
+          else z    // call `+` with two arguments: `2` and `if ...`
 
 Bits
 ====
@@ -166,18 +258,18 @@ Operator                                   Associativity       Description
  `/\`                                      right               Short-cut and
   `!=` `==`                                none                Not equals, equals
   `>` `<` `<=` `>=` `<$` `>$` `<=$` `>=$`  none                Comparisons
-  `||`                                     right               Logical or 
+  `||`                                     right               Logical or
   `^`                                      left                Exclusive-or
-  `&&`                                     right               Logical and 
+  `&&`                                     right               Logical and
   `~`                                      right               Logical negation
 
 Table: Bit operations.
 
-If Then Else with Multiway
-==========================
+Multi-way Conditionals
+======================
 
-`If then else` has been extended to support multi-way
-conditionals. Examples:
+The `if ... then ... else` construct can be used with
+multiple branches. For example:
 
     x = if y % 2 == 0 then 22 else 33
 
@@ -189,9 +281,9 @@ conditionals. Examples:
 Tuples and Records
 ==================
 
-Tuples and records are used for packaging multiples values together.
-Tuples are enclosed in parenthesis, while records are enclosed in
-braces.  The components of both tuples and records are separated by
+Tuples and records are used for packaging multiple values together.
+Tuples are enclosed in parentheses, while records are enclosed in
+curly braces.  The components of both tuples and records are separated by
 commas.  The components of tuples are expressions, while the
 components of records are a label and a value separated by an equal
 sign.  Examples:
@@ -211,6 +303,10 @@ ordering of record components is not important.  Examples:
 
     { x = 1, y = 2 } == { x = 1, y = 2 }    // True
     { x = 1, y = 2 } == { y = 2, x = 1 }    // True
+
+
+Accessing Fields
+----------------
 
 The components of a record or a tuple may be accessed in two ways: via
 pattern matching or by using explicit component selectors.  Explicit
@@ -248,6 +344,31 @@ patterns use braces.  Examples:
     f p = x + y where
         (x, y) = p
 
+
+Updating Fields
+---------------
+
+The components of a record or a tuple may be updated using the following
+notation:
+
+    // Example values
+    r = { x = 15, y = 20 }      // a record
+    t = (True,True)             // a tuple
+    n = { pt = r, size = 100 }  // nested record
+
+    // Setting fields
+    { r | x = 30 }          == { x = 30, y = 20 }
+    { t | 0 = False }       == (False,True)
+
+    // Update relative to the old value
+    { r | x -> x + 5 }      == { x = 20, y = 20 }
+
+    // Update a nested field
+    { n | pt.x = 10 }       == { pt = { x = 10, y = 20 }, size = 100 }
+    { n | pt.x -> x + 10 }  == { pt = { x = 25, y = 20 }, size = 100 }
+
+
+
 Sequences
 =========
 
@@ -258,21 +379,24 @@ _word_.  We may abbreviate the type `[n] Bit` as `[n]`.  An infinite
 sequence with elements of type `a` has type `[inf] a`, and `[inf]` is
 an infinite stream of bits.
 
-    [e1,e2,e3]                        // A sequence with three elements
+    [e1,e2,e3]                    // A sequence with three elements
 
-    [t .. ]                           // Sequence enumerations
-    [t1, t2 .. ]                      // Step by t2 - t1
-    [t1 .. t3 ]
-    [t1, t2 .. t3 ]
-    [e1 ... ]                         // Infinite sequence starting at e1
-    [e1, e2 ... ]                     // Infinite sequence stepping by e2-e1
+    [t1 .. t3 ]                   // Sequence enumerations
+    [t1, t2 .. t3 ]               // Step by t2 - t1
+    [e1 ... ]                     // Infinite sequence starting at e1
+    [e1, e2 ... ]                 // Infinite sequence stepping by e2-e1
 
-    [ e | p11 <- e11, p12 <- e12      // Sequence comprehensions
+    [ e | p11 <- e11, p12 <- e12  // Sequence comprehensions
         | p21 <- e21, p22 <- e22 ]
 
-Note: the bounds in finite unbounded (those with ..) sequences are
-type expressions, while the bounds in bounded-finite and infinite
-sequences are value expressions.
+    x = generate (\i -> e)        // Sequence from generating function
+    x @ i = e                     // Sequence with index binding
+    arr @ i @ j = e               // Two-dimensional sequence
+
+
+Note: the bounds in finite sequences (those with `..`) are type
+expressions, while the bounds in infinite sequences are value
+expressions.
 
 Operator                       Description
 ---------------------------    -----------
@@ -287,7 +411,7 @@ Operator                       Description
 
 Table: Sequence operations.
 
-There are also lifted point-wise operations.
+There are also lifted pointwise operations.
 
     [p1, p2, p3, p4]          // Sequence pattern
     p1 # p2                   // Split sequence pattern
@@ -312,7 +436,7 @@ Explicit Type Instantiation
 
 If `f` is a polymorphic value with type:
 
-    f : { tyParam }
+    f : { tyParam } tyParam
     f = zero
 
 you can evaluate `f`, passing it a type parameter:
@@ -326,13 +450,13 @@ Demoting Numeric Types to Values
 The value corresponding to a numeric type may be accessed using the
 following notation:
 
-    `{t}
+    `t
 
 Here `t` should be a type expression with numeric kind.  The resulting
 expression is a finite word, which is sufficiently large to accommodate
 the value of the type:
 
-    `{t} : {w >= width t}. [w]
+    `t : {n} (fin n, n >= width t) => [n]
 
 Explicit Type Annotations
 =========================
@@ -418,13 +542,11 @@ Sometimes, we may want to import only some of the definitions
 from a module.  To do so, we use an import declaration with
 an ***import list***.
 
-
-   module M where
+    module M where
 
     f = 0x02
     g = 0x03
     h = 0x04
-
 
     module N where
 
@@ -473,13 +595,13 @@ Another way to avoid name collisions is by using a
     f : [8]
     f = 2
 
-  module N where
+    module N where
 
-  import M as P
+    import M as P
 
-  g = P::f
-  // `f` was imported from `M`
-  // but when used it needs to be prefixed by the qualified `P`
+    g = P::f
+    // `f` was imported from `M`
+    // but when used it needs to be prefixed by the qualified `P`
 
 Qualified imports make it possible to work with definitions
 that happen to have the same name but are defined in different modules.

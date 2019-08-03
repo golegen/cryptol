@@ -15,6 +15,20 @@
 {-# LANGUAGE OverloadedStrings #-}
 module Cryptol.Parser.ParserUtils where
 
+import Data.Maybe(fromMaybe)
+import Data.Bits(testBit,setBit)
+import Control.Monad(liftM,ap,unless,guard)
+import           Data.Text(Text)
+import qualified Data.Text as T
+import qualified Data.Map as Map
+
+import GHC.Generics (Generic)
+import Control.DeepSeq
+
+import Prelude ()
+import Prelude.Compat
+
+
 import Cryptol.Parser.AST
 import Cryptol.Parser.Lexer
 import Cryptol.Parser.Position
@@ -23,18 +37,6 @@ import Cryptol.Utils.Ident(packModName)
 import Cryptol.Utils.PP
 import Cryptol.Utils.Panic
 
-import Data.Maybe(fromMaybe)
-import Data.Bits(testBit,setBit)
-import Control.Monad(liftM,ap,unless)
-import           Data.Text(Text)
-import qualified Data.Text as T
-
-
-import GHC.Generics (Generic)
-import Control.DeepSeq
-
-import Prelude ()
-import Prelude.Compat
 
 parseString :: Config -> ParseM a -> String -> Either ParseError a
 parseString cfg p cs = parse cfg p (T.pack cs)
@@ -182,7 +184,7 @@ getName l = case thing l of
 getNum :: Located Token -> Integer
 getNum l = case thing l of
              Token (Num x _ _) _ -> x
-             Token (ChrLit x) _  -> fromIntegral (fromEnum x)
+             Token (ChrLit x) _  -> toInteger (fromEnum x)
              _ -> panic "[Parser] getNum" ["not a number:", show l]
 
 getStr :: Located Token -> String
@@ -239,7 +241,6 @@ validDemotedType rng ty =
     TChar {}     -> ok
     TWild        -> bad "Wildcard types"
     TUser {}     -> ok
-    TApp {}      -> ok
 
     TParens t    -> validDemotedType rng t
     TInfix{}     -> ok
@@ -247,6 +248,7 @@ validDemotedType rng ty =
   where bad x = errorMessage rng (x ++ " cannot be demoted.")
         ok    = return $ at rng ty
 
+-- | Input expression are reversed
 mkEApp :: [Expr PName] -> Expr PName
 mkEApp es@(eLast : _) = at (eFirst,eLast) $ foldl EApp f xs
   where
@@ -284,10 +286,28 @@ unOp f x = at (f,x) $ EApp f x
 binOp :: Expr PName -> Located PName -> Expr PName -> Expr PName
 binOp x f y = at (x,y) $ EInfix x f defaultFixity y
 
-eFromTo :: Range -> Expr PName -> Maybe (Expr PName) -> Maybe (Expr PName) -> ParseM (Expr PName)
-eFromTo r e1 e2 e3 = EFromTo <$> exprToNumT r e1
-                             <*> mapM (exprToNumT r) e2
-                             <*> mapM (exprToNumT r) e3
+-- An element type ascription is allowed to appear on one of the arguments.
+eFromTo :: Range -> Expr PName -> Maybe (Expr PName) -> Expr PName -> ParseM (Expr PName)
+eFromTo r e1 e2 e3 =
+  case (asETyped e1, asETyped =<< e2, asETyped e3) of
+    (Just (e1', t), Nothing, Nothing) -> eFromToType r e1' e2 e3 (Just t)
+    (Nothing, Just (e2', t), Nothing) -> eFromToType r e1 (Just e2') e3 (Just t)
+    (Nothing, Nothing, Just (e3', t)) -> eFromToType r e1 e2 e3' (Just t)
+    (Nothing, Nothing, Nothing) -> eFromToType r e1 e2 e3 Nothing
+    _ -> errorMessage r "A sequence enumeration may have at most one element type annotation."
+  where
+    asETyped (ELocated e _) = asETyped e
+    asETyped (ETyped e t) = Just (e, t)
+    asETyped _ = Nothing
+
+eFromToType ::
+  Range -> Expr PName -> Maybe (Expr PName) -> Expr PName -> Maybe (Type PName) -> ParseM (Expr PName)
+eFromToType r e1 e2 e3 t =
+  EFromTo <$> exprToNumT r e1
+          <*> mapM (exprToNumT r) e2
+          <*> exprToNumT r e3
+          <*> pure t
+
 exprToNumT :: Range -> Expr PName -> ParseM (Type PName)
 exprToNumT r expr =
   case translateExprToNumT expr of
@@ -296,11 +316,7 @@ exprToNumT r expr =
   where
   bad = errorMessage (fromMaybe r (getLoc expr)) $ unlines
         [ "The boundaries of .. sequences should be valid numeric types."
-        , "The expression `" ++ show (pp expr) ++ "` is not."
-        , ""
-        , "If you were trying to specify the width of the elements,"
-        , "you may add a type annotation outside the sequence. For example:"
-        , "   [ 1 .. 10 ] : [_][16]"
+        , "The expression `" ++ show expr ++ "` is not."
         ]
 
 
@@ -351,6 +367,7 @@ changeExport :: ExportType -> [TopDecl PName] -> [TopDecl PName]
 changeExport e = map change
   where
   change (Decl d)      = Decl      d { tlExport = e }
+  change (DPrimType t) = DPrimType t { tlExport = e }
   change (TDNewtype n) = TDNewtype n { tlExport = e }
   change td@Include{}  = td
   change (DParameterType {}) = panic "changeExport" ["private type parameter?"]
@@ -374,7 +391,7 @@ mkTySyn ln ps b
     errorMessage (srcRange ln) "`width` is not a valid type synonym name."
 
   | otherwise =
-    return $ DType $ TySyn ln ps b
+    return $ DType $ TySyn ln Nothing ps b
 
 mkPropSyn :: Located PName -> [TParam PName] -> Type PName -> ParseM (Decl PName)
 mkPropSyn ln ps b
@@ -382,7 +399,7 @@ mkPropSyn ln ps b
     errorMessage (srcRange ln) "`width` is not a valid constraint synonym name."
 
   | otherwise =
-    DProp . PropSyn ln ps . thing <$> mkProp b
+    DProp . PropSyn ln Nothing ps . thing <$> mkProp b
 
 polyTerm :: Range -> Integer -> Integer -> ParseM (Bool, Integer)
 polyTerm rng k p
@@ -419,6 +436,34 @@ mkProperty f ps e = DBind Bind { bName       = f
                                , bDoc        = Nothing
                                }
 
+-- NOTE: The lists of patterns are reversed!
+mkIndexedDecl ::
+  LPName -> ([Pattern PName], [Pattern PName]) -> Expr PName -> Decl PName
+mkIndexedDecl f (ps, ixs) e =
+  DBind Bind { bName       = f
+             , bParams     = reverse ps
+             , bDef        = at e (Located emptyRange (DExpr rhs))
+             , bSignature  = Nothing
+             , bPragmas    = []
+             , bMono       = False
+             , bInfix      = False
+             , bFixity     = Nothing
+             , bDoc        = Nothing
+             }
+  where
+    rhs :: Expr PName
+    rhs = mkGenerate (reverse ixs) e
+
+-- NOTE: The lists of patterns are reversed!
+mkIndexedExpr :: ([Pattern PName], [Pattern PName]) -> Expr PName -> Expr PName
+mkIndexedExpr (ps, ixs) body
+  | null ps = mkGenerate (reverse ixs) body
+  | otherwise = EFun (reverse ps) (mkGenerate (reverse ixs) body)
+
+mkGenerate :: [Pattern PName] -> Expr PName -> Expr PName
+mkGenerate pats body =
+  foldr (\pat e -> EGenerate (EFun [pat] e)) body pats
+
 mkIf :: [(Expr PName, Expr PName)] -> Expr PName -> Expr PName
 mkIf ifThens theElse = foldr addIfThen theElse ifThens
     where
@@ -430,7 +475,8 @@ mkIf ifThens theElse = foldr addIfThen theElse ifThens
 -- pass.  This is also the reason we add the doc to the TopLevel constructor,
 -- instead of just place it on the binding directly.  A better solution might be
 -- to just have a different constructor for primitives.
-mkPrimDecl :: Maybe (Located String) -> LPName -> Schema PName -> [TopDecl PName]
+mkPrimDecl ::
+  Maybe (Located String) -> LPName -> Schema PName -> [TopDecl PName]
 mkPrimDecl mbDoc ln sig =
   [ exportDecl mbDoc Public
     $ DBind Bind { bName      = ln
@@ -446,6 +492,73 @@ mkPrimDecl mbDoc ln sig =
   , exportDecl Nothing Public
     $ DSignature [ln] sig
   ]
+
+mkPrimTypeDecl ::
+  Maybe (Located String) ->
+  Schema PName ->
+  Located Kind ->
+  ParseM [TopDecl PName]
+mkPrimTypeDecl mbDoc (Forall as qs st ~(Just schema_rng)) finK =
+  case splitT schema_rng st of
+    Just (n,xs) ->
+      do vs <- mapM tpK as
+         unless (distinct (map fst vs)) $
+            errorMessage schema_rng "Repeated parameterms."
+         let kindMap = Map.fromList vs
+             lkp v = case Map.lookup (thing v) kindMap of
+                       Just (k,tp)  -> pure (k,tp)
+                       Nothing ->
+                        errorMessage
+                            (srcRange v)
+                            ("Undefined parameter: " ++ show (pp (thing v)))
+         (as',ins) <- unzip <$> mapM lkp xs
+         unless (length vs == length xs) $
+           errorMessage schema_rng "All parameters should appear in the type."
+
+         let ki = finK { thing = foldr KFun (thing finK) ins }
+
+         pure [ DPrimType TopLevel
+                  { tlExport = Public
+                  , tlDoc    = mbDoc
+                  , tlValue  = PrimType { primTName   = n
+                                        , primTKind   = ki
+                                        , primTCts    = (as',qs)
+                                        , primTFixity = Nothing
+                                        }
+                 }
+              ]
+
+    Nothing -> errorMessage schema_rng "Invalid primitive signature"
+
+  where
+  splitT r ty = case ty of
+                  TLocated t r1 -> splitT r1 t
+                  TUser n ts -> mkT r Located { srcRange = r, thing = n } ts
+                  TInfix t1 n _ t2  -> mkT r n [t1,t2]
+                  _ -> Nothing
+
+  mkT r n ts = do ts1 <- mapM (isVar r) ts
+                  guard (distinct (map thing ts1))
+                  pure (n,ts1)
+
+  isVar r ty = case ty of
+                 TLocated t r1  -> isVar r1 t
+                 TUser n []     -> Just Located { srcRange = r, thing = n }
+                 _              -> Nothing
+
+  -- inefficient, but the lists should be small
+  distinct xs = case xs of
+                  [] -> True
+                  x : ys -> not (x `elem` ys) && distinct ys
+
+  tpK tp = case tpKind tp of
+             Just k  -> pure (tpName tp, (tp,k))
+             Nothing ->
+              case tpRange tp of
+                Just r -> errorMessage r "Parameters need a kind annotation"
+                Nothing -> panic "mkPrimTypeDecl"
+                              [ "Missing range on schema parameter." ]
+
 
 -- | Fix-up the documentation strings by removing the comment delimiters on each
 -- end, and stripping out common prefixes on all the remaining lines.
@@ -503,13 +616,12 @@ mkProp ty =
 
   props r t =
     case t of
-      TInfix{}       -> infixProp t
-      TUser f xs     -> prefixProp r f xs
+      TInfix{}       -> return [CType t]
+      TUser{}        -> return [CType t]
       TTuple ts      -> concat `fmap` mapM (props r) ts
       TParens t'     -> props r  t'
       TLocated t' r' -> props r' t'
 
-      TApp{}    -> err
       TFun{}    -> err
       TSeq{}    -> err
       TBit{}    -> err
@@ -520,32 +632,6 @@ mkProp ty =
 
     where
     err = errorMessage r "Invalid constraint"
-
-  -- we have to delay these until renaming, when we have the fixity table
-  -- present
-  infixProp t = return [CType t]
-
-  -- these can be translated right away
-  prefixProp r f xs
-    | i == zeroIdent,      [x] <- xs = return [CLocated (CZero x) r]
-    | i == logicIdent,     [x] <- xs = return [CLocated (CLogic x) r]
-    | i == arithIdent,     [x] <- xs = return [CLocated (CArith x) r]
-    | i == finIdent,       [x] <- xs = return [CLocated (CFin x) r]
-    | i == cmpIdent,       [x] <- xs = return [CLocated (CCmp x) r]
-    | i == signedCmpIdent, [x] <- xs = return [CLocated (CSignedCmp x) r]
-    | i == literalIdent, [x,y] <- xs = return [CLocated (CLiteral x y) r]
-    | otherwise                      = return [CLocated (CType (TUser f xs)) r]
-    where
-    i = getIdent f
-
-zeroIdent, logicIdent, arithIdent, finIdent, cmpIdent, signedCmpIdent, literalIdent :: Ident
-zeroIdent      = mkIdent "Zero"
-logicIdent     = mkIdent "Logic"
-arithIdent     = mkIdent "Arith"
-finIdent       = mkIdent "fin"
-cmpIdent       = mkIdent "Cmp"
-signedCmpIdent = mkIdent "SignedCmp"
-literalIdent   = mkIdent "Literal"
 
 -- | Make an ordinary module
 mkModule :: Located ModName ->
@@ -575,4 +661,32 @@ mkModuleInstance nm fun (is,ds) =
          , mImports  = is
          , mDecls    = ds
          }
+
+ufToNamed :: UpdField PName -> ParseM (Named (Expr PName))
+ufToNamed (UpdField h ls e) =
+  case (h,ls) of
+    (UpdSet, [l]) | RecordSel i Nothing <- thing l ->
+      pure Named { name = l { thing = i }, value = e }
+    _ -> errorMessage (srcRange (head ls))
+            "Invalid record field.  Perhaps you meant to update a record?"
+
+selExprToSels :: Expr PName -> ParseM [Located Selector]
+selExprToSels e0 = reverse <$> go noLoc e0
+  where
+  noLoc = panic "selExprToSels" ["Missing location?"]
+  go loc expr =
+    case expr of
+      ELocated e1 r -> go r e1
+      ESel e2 s ->
+        do ls <- go loc e2
+           let rng = loc { from = to (srcRange (head ls)) }
+           pure (Located { thing = s, srcRange = rng } : ls)
+      EVar (UnQual l) ->
+        pure [ Located { thing = RecordSel l Nothing, srcRange = loc } ]
+      ELit (ECNum n _) ->
+        pure [ Located { thing = TupleSel (fromInteger n) Nothing
+                       , srcRange = loc } ]
+      _ -> errorMessage loc "Invalid label in record update."
+
+
 

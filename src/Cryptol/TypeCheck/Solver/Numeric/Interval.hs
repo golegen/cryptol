@@ -42,8 +42,9 @@ typeInterval varInfo = go
           (TF TCWidth, [x])   -> iWidth (go x)
           (TF TCMin, [x,y])   -> iMin (go x) (go y)
           (TF TCMax, [x,y])   -> iMax (go x) (go y)
-          (TF TCLenFromThen, [x,y,z]) ->
-            iLenFromThen (go x) (go y) (go z)
+
+          (TF TCCeilDiv, [x,y]) -> iCeilDiv (go x) (go y)
+          (TF TCCeilMod, [x,y]) -> iCeilMod (go x) (go y)
 
           (TF TCLenFromThenTo, [x,y,z]) ->
             iLenFromThenTo (go x) (go y) (go z)
@@ -146,7 +147,7 @@ data Interval = Interval
   { iLower :: Nat'          -- ^ lower bound (inclusive)
   , iUpper :: Maybe Nat'    -- ^ upper bound (inclusive)
                             -- If there is no upper bound,
-                            -- than all *natural* numbers.
+                            -- then all *natural* numbers.
   } deriving (Eq,Show)
 
 ppIntervals :: Map TVar Interval -> Doc
@@ -337,23 +338,31 @@ iMod _ j = Interval { iLower = Nat 0, iUpper = upper }
             _                    -> Nothing
 
 
+iCeilDiv :: Interval -> Interval -> Interval
+iCeilDiv i j = Interval { iLower = lower, iUpper = upper }
+  where
+  lower = case iUpper j of
+            Nothing -> if iLower i == Nat 0 then Nat 0 else Nat 1
+            Just x  -> case nCeilDiv (iLower i) x of
+                         Nothing -> Nat 0   -- malformed division
+                         Just y  -> y
+
+  upper = case iUpper i of
+            Nothing -> Nothing
+            Just x  -> case nCeilDiv x (nMax (iLower i) (Nat 1)) of
+                         Nothing -> Just Inf
+                         Just y  -> Just y
+
+
+iCeilMod :: Interval -> Interval -> Interval
+iCeilMod = iMod -- bounds are the same as for Mod
+
 iWidth :: Interval -> Interval
 iWidth i = Interval { iLower = nWidth (iLower i)
                     , iUpper = case iUpper i of
                                  Nothing -> Nothing
                                  Just n  -> Just (nWidth n)
                     }
-
-iLenFromThen :: Interval -> Interval -> Interval -> Interval
-iLenFromThen i j w
-  | Just x <- iIsExact i, Just y <- iIsExact j, Just z <- iIsExact w
-  , Just r <- nLenFromThen x y z = iConst r
-  | otherwise =
-      case iUpper w of
-        Just (Nat n) ->
-                    Interval { iLower = Nat 0, iUpper = Just (Nat (2^n - 1)) }
-        _ -> iAnyFin
-
 
 iLenFromThenTo :: Interval -> Interval -> Interval -> Interval
 iLenFromThenTo i j k

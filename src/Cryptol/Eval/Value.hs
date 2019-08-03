@@ -181,10 +181,10 @@ mapSeqMap :: (GenValue b w i -> Eval (GenValue b w i))
 mapSeqMap f x =
   memoMap (IndexSeqMap $ \i -> f =<< lookupSeqMap x i)
 
--- | For efficency reasons, we handle finite sequences of bits as special cases
+-- | For efficiency reasons, we handle finite sequences of bits as special cases
 --   in the evaluator.  In cases where we know it is safe to do so, we prefer to
 --   used a "packed word" representation of bit sequences.  This allows us to rely
---   directly on Integer types (in the concrete evalautor) and SBV's Word types (in
+--   directly on Integer types (in the concrete evaluator) and SBV's Word types (in
 --   the symbolic simulator).
 --
 --   However, if we cannot be sure all the bits of the sequence
@@ -541,8 +541,9 @@ class BitWord b w i | b -> w, w -> i, i -> b where
 -- | This class defines additional operations necessary to define generic evaluation
 --   functions.
 class BitWord b w i => EvalPrims b w i where
-  -- | Eval prim binds primitive declarations to the primitive values that implement them.
-  evalPrim :: Decl -> GenValue b w i
+  -- | Eval prim binds primitive declarations to the primitive values that implement them.  Returns 'Nothing' for abstract primitives (i.e., once that are
+  -- not implemented by this backend).
+  evalPrim :: Decl -> Maybe (GenValue b w i)
 
   -- | if/then/else operation.  Choose either the 'then' value or the 'else' value depending
   --   on the value of the test bit.
@@ -628,7 +629,10 @@ instance BitWord Bool BV Integer where
 
 -- | Create a packed word of n bits.
 word :: BitWord b w i => Integer -> Integer -> GenValue b w i
-word n i = VWord n $ ready $ WordVal $ wordLit n i
+word n i
+  | n >= Arch.maxBigIntWidth = wordTooWide n
+  | otherwise                = VWord n $ ready $ WordVal $ wordLit n i
+
 
 lam :: (Eval (GenValue b w i) -> Eval (GenValue b w i)) -> GenValue b w i
 lam  = VFun

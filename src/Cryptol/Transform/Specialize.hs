@@ -77,6 +77,7 @@ specializeExpr expr =
     ETuple es     -> ETuple <$> traverse specializeExpr es
     ERec fs       -> ERec <$> traverse (traverseSnd specializeExpr) fs
     ESel e s      -> ESel <$> specializeExpr e <*> pure s
+    ESet e s v    -> ESet <$> specializeExpr e <*> pure s <*> specializeExpr v
     EIf e1 e2 e3  -> EIf <$> specializeExpr e1 <*> specializeExpr e2 <*> specializeExpr e3
     EComp len t e mss -> EComp len t <$> specializeExpr e <*> traverse (traverse specializeMatch) mss
     -- Bindings within list comprehensions always have monomorphic types.
@@ -309,7 +310,6 @@ freshName n _ =
 --         TCWidth         -> "width"
 --         TCMin           -> "min"
 --         TCMax           -> "max"
---         TCLenFromThen   -> "len_from_then"
 --         TCLenFromThenTo -> "len_from_then_to"
 --     showRecFld (nm,t) = showName nm : showT t
 
@@ -337,20 +337,6 @@ allDeclGroups =
     concatMap mDecls
   . M.loadedModules
 
-allLoadedModules :: M.ModuleEnv -> [M.LoadedModule]
-allLoadedModules =
-    M.getLoadedModules
-  . M.meLoadedModules
-
-allPublicNames :: M.ModuleEnv -> [Name]
-allPublicNames =
-    concatMap
-      ( Map.keys
-      . M.ifDecls
-      . M.ifPublic
-      . M.lmInterface
-      )
-  . allLoadedModules
 
 traverseSnd :: Functor f => (b -> f c) -> (a, b) -> f (a, c)
 traverseSnd f (x, y) = (,) x <$> f y

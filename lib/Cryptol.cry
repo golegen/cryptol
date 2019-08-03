@@ -27,50 +27,178 @@ infixr 50 &&
 infixr 60 #
 infixl 70 <<, <<<, >>, >>>, >>$
 infixl 80 +, -
-infixl 90 *, /, %, /$, %$
+infixl 90 *, /, %, /$, %$, %^, /^
 infixr 95 ^^
 infixl 100 @, @@, !, !!
 
+// -----------------------------------------------------------------------------
+
+/** A numeric type representing infinity. */
+primitive type inf : #
+
+/** The type of boolean values. */
+primitive type Bit : *
+
+/** The type of unbounded integers. */
+primitive type Integer : *
+
+/** 'Z n' is the type of integers, modulo 'n'. */
+primitive type {n : #} (fin n, n >= 1) => Z n : *
+
+
+
+/** Assert that two numeric types are equal. */
+primitive type (==) : # -> # -> Prop
+
+/** Assert that two numeric types are different. */
+primitive type (!=) : # -> # -> Prop
+
+/** Assert that the first numeric type is larger than, or equal to the second.*/
+primitive type (>=) : # -> # -> Prop
+
+/** Assert that a numeric type is a proper natural number (not 'inf'). */
+primitive type fin : * -> Prop
+
+/** Value types that have a notion of 'zero'. */
+primitive type Zero : * -> Prop
+
+/** Value types that support logical operations. */
+primitive type Logic : * -> Prop
+
+/** Value types that support arithmetic. */
+primitive type Arith : * -> Prop
+
+/** Value types that support unsigned comparisons. */
+primitive type Cmp : * -> Prop
+
+/** Value types that support signed comparisons. */
+primitive type SignedCmp : * -> Prop
+
+/** 'Literal n a' asserts that type 'a' contains the number 'n'. */
+primitive type Literal : # -> * -> Prop
+
+
+
+/** Add numeric types. */
+primitive type (+) : # -> # -> #
+
+/** Subtract numeric types. */
+primitive type
+  {m : #, n : # }
+  (fin n, m >= n) =>
+  m - n : #
+
+/** Multiply numeric types. */
+primitive type (*) : # -> # -> #
+
+/** Divide numeric types, rounding down. */
+primitive type
+  { m : #, n : # }
+  (fin m, n >= 1) =>
+  m / n : #
+
+/** Remainder of numeric type division. */
+primitive type
+  { m : #, n : # }
+  (fin m, n >= 1) =>
+  m % n : #
+
+/** Exponentiate numeric types. */
+primitive type (^^) : # -> # -> #
+
+/** The number of bits required to represent the value of a numeric type. */
+primitive type width : # -> #
+
+/** The smaller of two numeric types. */
+primitive type min : # -> # -> #
+
+/** The larger of two numeric types. */
+primitive type max : # -> # -> #
+
+/** Divide numeric types, rounding up. */
+primitive type
+  { m : #, n : # }
+  (fin m, fin n, n >= 1) =>
+  m /^ n : #
+
+/** How much we need to add to make a proper multiple of the second argument. */
+primitive type
+  { m : #, n : # }
+  (fin m, fin n, n >= 1) =>
+  m %^ n : #
+
+/** The length of an enumeration. */
+primitive type
+  { start : #, next : #, last : # }
+  (fin start, fin next, fin last, start != next) =>
+  lengthFromThenTo start next last : #
+
+
+
+
+// -----------------------------------------------------------------------------
+
+/**
+ * Assert that the first numeric type is less than or equal to the second.
+ */
+type constraint i <= j = (j >= i)
+
+/**
+ * Assert that the first numeric type is greater than the second.
+ */
+type constraint i > j = i >= j + 1
+
+/**
+ * Assert that the first numeric type is less than the second.
+ */
+type constraint i < j = j >= i + 1
+
 /**
  * Add two values.
- *  * For words, addition uses modulo arithmetic.
+ *  * For type [n], addition is modulo 2^^n.
  *  * Structured values are added element-wise.
  */
 primitive (+) : {a} (Arith a) => a -> a -> a
 
 /**
- * For words, subtraction uses modulo arithmetic.
- * Structured values are subtracted element-wise. Defined as:
- * a - b = a + negate b
- * See also: `negate'.
+ * Subtract two values.
+ *  * For type [n], subtraction is modulo 2^^n.
+ *  * Structured values are subtracted element-wise.
+ *  * Satisfies 'a - b = a + negate b'.
+ * See also: 'negate'.
  */
 primitive (-) : {a} (Arith a) => a -> a -> a
 
 /**
- * For words, multiplies two words, modulus 2^^a.
- * Structured values are multiplied element-wise.
+ * Multiply two values.
+ *  * For type [n], multiplication is modulo 2^^n.
+ *  * Structured values are multiplied element-wise.
  */
 primitive (*) : {a} (Arith a) => a -> a -> a
 
 /**
- * For words, divides two words, modulus 2^^a.
- * Structured values are divided element-wise.
+ * Divide two values, rounding down.
+ *  * For type [n], the arguments are treated as unsigned.
+ *  * Structured values are divided element-wise.
+ *  * Division by zero is undefined.
  */
 primitive (/) : {a} (Arith a) => a -> a -> a
 
 /**
- * For words, takes the modulus of two words, modulus 2^^a.
- * Over structured values, operates element-wise.
- * Be careful, as this will often give unexpected results due to interaction of
- * the two moduli.
+ * Compute the remainder from dividing two values.
+ *  * For type [n], the arguments are treated as unsigned.
+ *  * Structured values are combined element-wise.
+ *  * Remainder of division by zero is undefined.
+ *  * Satisfies 'x % y == x - (x / y) * y'.
  */
 primitive (%) : {a} (Arith a) => a -> a -> a
 
 /**
- * For words, takes the exponent of two words, modulus 2^^a.
- * Over structured values, operates element-wise.
- * Be careful, due to its fast-growing nature, exponentiation is prone to
- * interacting poorly with defaulting.
+ * Compute the exponentiation of two values.
+ *  * For type [n], the exponent is treated as unsigned,
+ *    and the result is reduced modulo 2^^n.
+ *  * For type Integer, negative powers are undefined.
+ *  * Structured values are combined element-wise.
  */
 primitive (^^) : {a} (Arith a) => a -> a -> a
 
@@ -96,9 +224,11 @@ primitive True  : Bit
 primitive False : Bit
 
 /**
- * Returns the twos complement of its argument.
+ * Returns the two's complement of its argument.
  * Over structured values, operates element-wise.
- * negate a = ~a + 1
+ * The prefix notation '- x' is syntactic sugar
+ * for 'negate x'.
+ * Satisfies 'negate a = ~a + 1'.
  */
 primitive negate : {a} (Arith a) => a -> a
 
@@ -453,19 +583,6 @@ updatesEnd xs0 idxs vals = xss!0
          ]
 
 /**
- * A finite arithmetic sequence starting with 'first' and 'next',
- * stopping when the values would wrap around modulo '2^^bits'.
- *
- * '[a,b..]' is syntactic sugar for 'fromThen`{first=a,next=b}'.
- * '[a..]' is syntactic sugar for 'fromThen`{first=a,next=a+1}'.
- */
-primitive fromThen : {first, next, bits, len}
-                     ( fin first, fin next, fin bits
-                     , bits >= width first, bits >= width next
-                     , first != next
-                     , lengthFromThen first next bits == len) => [len][bits]
-
-/**
  * A finite sequence counting up from 'first' to 'last'.
  *
  * '[a..b]' is syntactic sugar for 'fromTo`{first=a,last=b}'.
@@ -496,6 +613,17 @@ primitive infFrom : {a} (Arith a) => a -> [inf]a
  * '[x,y...]' is syntactic sugar for 'infFromThen x y'.
  */
 primitive infFromThen : {a} (Arith a) => a -> a -> [inf]a
+
+/**
+ * Produce a sequence using a generating function.
+ * Satisfies 'generate f @ i == f i' for all 'i' between '0' and 'n-1'.
+ *
+ * Declarations of the form 'x @ i = e' are syntactic sugar for
+ * 'x = generate (\i -> e)'.
+ */
+generate : {n, ix, a}
+  (fin ix, n >= 1, ix >= width (n - 1)) => ([ix] -> a) -> [n]a
+generate f = [ f i | i <- [0 .. n-1] ]
 
 primitive error : {a, len} (fin len) => [len][8] -> a
 

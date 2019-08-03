@@ -23,7 +23,7 @@ tnamesNT x = ([ nName x ], ())
 
 -- | The names defined and used by a group of mutually recursive declarations.
 namesDs :: Ord name => [Decl name] -> ([Located name], Set name)
-namesDs ds = (defs, boundNames defs (Set.unions frees))
+namesDs ds = (defs, boundLNames defs (Set.unions frees))
   where
   defs          = concat defss
   (defss,frees) = unzip (map namesD ds)
@@ -57,15 +57,9 @@ allNamesD decl =
     DProp ps        -> [psName ps]
     DLocated d _    -> allNamesD d
 
-tsName :: TySyn name -> Located name
-tsName (TySyn lqn _ _) = lqn
-
-psName :: PropSyn name -> Located name
-psName (PropSyn lqn _ _) = lqn
-
 -- | The names defined and used by a single binding.
 namesB :: Ord name => Bind name -> ([Located name], Set name)
-namesB b = ([bName b], boundNames (namesPs (bParams b)) (namesDef (thing (bDef b))))
+namesB b = ([bName b], boundLNames (namesPs (bParams b)) (namesDef (thing (bDef b))))
 
 
 namesDef :: Ord name => BindDef name -> Set name
@@ -81,27 +75,34 @@ namesE expr =
     ELit _        -> Set.empty
     ENeg e        -> namesE e
     EComplement e -> namesE e
+    EGenerate e   -> namesE e
     ETuple es     -> Set.unions (map namesE es)
     ERecord fs    -> Set.unions (map (namesE . value) fs)
     ESel e _      -> namesE e
+    EUpd mb fs    -> let e = maybe Set.empty namesE mb
+                     in Set.unions (e : map namesUF fs)
     EList es      -> Set.unions (map namesE es)
-    EFromTo _ _ _ -> Set.empty
+    EFromTo{}     -> Set.empty
     EInfFrom e e' -> Set.union (namesE e) (maybe Set.empty namesE e')
     EComp e arms  -> let (dss,uss) = unzip (map namesArm arms)
-                     in Set.union (boundNames (concat dss) (namesE e))
+                     in Set.union (boundLNames (concat dss) (namesE e))
                                   (Set.unions uss)
     EApp e1 e2    -> Set.union (namesE e1) (namesE e2)
     EAppT e _     -> namesE e
     EIf e1 e2 e3  -> Set.union (namesE e1) (Set.union (namesE e2) (namesE e3))
     EWhere  e ds  -> let (bs,xs) = namesDs ds
-                     in Set.union (boundNames bs (namesE e)) xs
+                     in Set.union (boundLNames bs (namesE e)) xs
     ETyped e _    -> namesE e
     ETypeVal _    -> Set.empty
-    EFun ps e     -> boundNames (namesPs ps) (namesE e)
+    EFun ps e     -> boundLNames (namesPs ps) (namesE e)
     ELocated e _  -> namesE e
 
+    ESplit e      -> namesE e
     EParens e     -> namesE e
     EInfix a o _ b-> Set.insert (thing o) (Set.union (namesE a) (namesE b))
+
+namesUF :: Ord name => UpdField name -> Set name
+namesUF (UpdField _ _ e) = namesE e
 
 -- | The names defined by a group of patterns.
 namesPs :: [Pattern name] -> [Located name]
@@ -130,60 +131,25 @@ namesArm :: Ord name => [Match name] -> ([Located name], Set name)
 namesArm = foldr combine ([],Set.empty) . map namesM
   where combine (ds1,fs1) (ds2,fs2) =
           ( filter ((`notElem` map thing ds2) . thing) ds1 ++ ds2
-          , Set.union fs1 (boundNames ds1 fs2)
+          , Set.union fs1 (boundLNames ds1 fs2)
           )
 
 -- | Remove some defined variables from a set of free variables.
-boundNames :: Ord name => [Located name] -> Set name -> Set name
-boundNames bs xs = Set.difference xs (Set.fromList (map thing bs))
+boundLNames :: Ord name => [Located name] -> Set name -> Set name
+boundLNames = boundNames . map thing
 
+-- | Remove some defined variables from a set of free variables.
+boundNames :: Ord name => [name] -> Set name -> Set name
+boundNames = boundNamesSet . Set.fromList
 
--- | Given the set of type variables that are in scope,
--- compute the type synonyms used by a type.
-namesT :: Ord name => Set name -> Type name -> Set name
-namesT vs = go
-  where
-  go ty =
-    case ty of
-      TWild         -> Set.empty
-      TFun t1 t2    -> Set.union (go t1) (go t2)
-      TSeq t1 t2    -> Set.union (go t1) (go t2)
-      TBit          -> Set.empty
-      TNum _        -> Set.empty
-      TChar _       -> Set.empty
-      TApp _ ts     -> Set.unions (map go ts)
-      TTuple ts     -> Set.unions (map go ts)
-      TRecord fs    -> Set.unions (map (go . value) fs)
-      TLocated t _  -> go t
-      TUser x [] | x `Set.member` vs
-                    -> Set.empty
-      TUser x ts    -> Set.insert x (Set.unions (map go ts))
+-- | Remove some defined variables from a set of free variables.
+boundNamesSet :: Ord name => Set name -> Set name -> Set name
+boundNamesSet bs xs = Set.difference xs bs
 
-      TParens t     -> namesT vs t
-      TInfix a _ _ b-> Set.union (namesT vs a) (namesT vs b)
-
--- | Given the set of type variables that are in scope,
--- compute the type/constraint synonyms used by a prop.
-namesC :: Ord name => Set name -> Prop name -> Set name
-namesC vs prop =
-  case prop of
-    CFin t        -> namesT vs t
-    CEqual t1 t2  -> Set.union (namesT vs t1) (namesT vs t2)
-    CNeq   t1 t2  -> Set.union (namesT vs t1) (namesT vs t2)
-    CGeq t1 t2    -> Set.union (namesT vs t1) (namesT vs t2)
-    CZero t       -> namesT vs t
-    CLogic t      -> namesT vs t
-    CArith t      -> namesT vs t
-    CCmp t        -> namesT vs t
-    CSignedCmp t  -> namesT vs t
-    CLiteral t1 t2-> Set.union (namesT vs t1) (namesT vs t2)
-    CUser x ts    -> Set.insert x (Set.unions (map (namesT vs) ts))
-    CLocated p _  -> namesC vs p
-    CType t       -> namesT vs t
 
 -- | The type names defined and used by a group of mutually recursive declarations.
 tnamesDs :: Ord name => [Decl name] -> ([Located name], Set name)
-tnamesDs ds = (defs, boundNames defs (Set.unions frees))
+tnamesDs ds = (defs, boundLNames defs (Set.unions frees))
   where
   defs          = concat defss
   (defss,frees) = unzip (map tnamesD ds)
@@ -198,8 +164,10 @@ tnamesD decl =
     DBind b              -> ([], tnamesB b)
     DPatBind _ e         -> ([], tnamesE e)
     DLocated d _         -> tnamesD d
-    DType (TySyn n ps t) -> ([n], Set.difference (tnamesT t) (Set.fromList (map tpName ps)))
-    DProp (PropSyn n ps cs)
+    DType (TySyn n _ ps t)
+                         -> ([n], Set.difference (tnamesT t)
+                                  (Set.fromList (map tpName ps)))
+    DProp (PropSyn n _ ps cs)
                          -> ([n], Set.difference (Set.unions (map tnamesC cs))
                                   (Set.fromList (map tpName ps)))
 
@@ -219,30 +187,39 @@ tnamesDef (DExpr e) = tnamesE e
 tnamesE :: Ord name => Expr name -> Set name
 tnamesE expr =
   case expr of
-    EVar _        -> Set.empty
-    ELit _        -> Set.empty
-    ENeg e        -> tnamesE e
-    EComplement e -> tnamesE e
-    ETuple es     -> Set.unions (map tnamesE es)
-    ERecord fs    -> Set.unions (map (tnamesE . value) fs)
-    ESel e _      -> tnamesE e
-    EList es      -> Set.unions (map tnamesE es)
-    EFromTo a b c -> Set.union (tnamesT a)
-                     (Set.union (maybe Set.empty tnamesT b) (maybe Set.empty tnamesT c))
-    EInfFrom e e' -> Set.union (tnamesE e) (maybe Set.empty tnamesE e')
-    EComp e mss   -> Set.union (tnamesE e) (Set.unions (map tnamesM (concat mss)))
-    EApp e1 e2    -> Set.union (tnamesE e1) (tnamesE e2)
-    EAppT e fs    -> Set.union (tnamesE e) (Set.unions (map tnamesTI fs))
-    EIf e1 e2 e3  -> Set.union (tnamesE e1) (Set.union (tnamesE e2) (tnamesE e3))
-    EWhere  e ds  -> let (bs,xs) = tnamesDs ds
-                     in Set.union (boundNames bs (tnamesE e)) xs
-    ETyped e t    -> Set.union (tnamesE e) (tnamesT t)
-    ETypeVal t    -> tnamesT t
-    EFun ps e     -> Set.union (Set.unions (map tnamesP ps)) (tnamesE e)
-    ELocated e _  -> tnamesE e
+    EVar _          -> Set.empty
+    ELit _          -> Set.empty
+    ENeg e          -> tnamesE e
+    EComplement e   -> tnamesE e
+    EGenerate e     -> tnamesE e
+    ETuple es       -> Set.unions (map tnamesE es)
+    ERecord fs      -> Set.unions (map (tnamesE . value) fs)
+    ESel e _        -> tnamesE e
+    EUpd mb fs      -> let e = maybe Set.empty tnamesE mb
+                       in Set.unions (e : map tnamesUF fs)
+    EList es        -> Set.unions (map tnamesE es)
+    EFromTo a b c t -> tnamesT a
+                       `Set.union` maybe Set.empty tnamesT b
+                       `Set.union` tnamesT c
+                       `Set.union` maybe Set.empty tnamesT t
+    EInfFrom e e'   -> Set.union (tnamesE e) (maybe Set.empty tnamesE e')
+    EComp e mss     -> Set.union (tnamesE e) (Set.unions (map tnamesM (concat mss)))
+    EApp e1 e2      -> Set.union (tnamesE e1) (tnamesE e2)
+    EAppT e fs      -> Set.union (tnamesE e) (Set.unions (map tnamesTI fs))
+    EIf e1 e2 e3    -> Set.union (tnamesE e1) (Set.union (tnamesE e2) (tnamesE e3))
+    EWhere  e ds    -> let (bs,xs) = tnamesDs ds
+                       in Set.union (boundLNames bs (tnamesE e)) xs
+    ETyped e t      -> Set.union (tnamesE e) (tnamesT t)
+    ETypeVal t      -> tnamesT t
+    EFun ps e       -> Set.union (Set.unions (map tnamesP ps)) (tnamesE e)
+    ELocated e _    -> tnamesE e
 
-    EParens e     -> tnamesE e
-    EInfix a _ _ b-> Set.union (tnamesE a) (tnamesE b)
+    ESplit e        -> tnamesE e
+    EParens e       -> tnamesE e
+    EInfix a _ _ b  -> Set.union (tnamesE a) (tnamesE b)
+
+tnamesUF :: Ord name => UpdField name -> Set name
+tnamesUF (UpdField _ _ e) = tnamesE e
 
 tnamesTI :: Ord name => TypeInst name -> Set name
 tnamesTI (NamedInst f)  = tnamesT (value f)
@@ -276,18 +253,6 @@ tnamesS (Forall params props ty _) =
 tnamesC :: Ord name => Prop name -> Set name
 tnamesC prop =
   case prop of
-    CFin t         -> tnamesT t
-    CEqual t1 t2   -> Set.union (tnamesT t1) (tnamesT t2)
-    CNeq   t1 t2   -> Set.union (tnamesT t1) (tnamesT t2)
-    CGeq t1 t2     -> Set.union (tnamesT t1) (tnamesT t2)
-    CZero t        -> tnamesT t
-    CLogic t       -> tnamesT t
-    CArith t       -> tnamesT t
-    CCmp t         -> tnamesT t
-    CSignedCmp t   -> tnamesT t
-    CLiteral t1 t2 -> Set.union (tnamesT t1) (tnamesT t2)
-    CUser x ts     -> Set.insert x (Set.unions (map tnamesT ts))
-    CLocated p _   -> tnamesC p
     CType t        -> tnamesT t
 
 -- | Compute the type synonyms/type variables used by a type.
@@ -300,10 +265,10 @@ tnamesT ty =
     TBit          -> Set.empty
     TNum _        -> Set.empty
     TChar __      -> Set.empty
-    TApp _ ts     -> Set.unions (map tnamesT ts)
     TTuple ts     -> Set.unions (map tnamesT ts)
     TRecord fs    -> Set.unions (map (tnamesT . value) fs)
     TLocated t _  -> tnamesT t
     TUser x ts    -> Set.insert x (Set.unions (map tnamesT ts))
     TParens t     -> tnamesT t
-    TInfix a _ _ c-> Set.union (tnamesT a) (tnamesT c)
+    TInfix a x _ c-> Set.insert (thing x)
+                                (Set.union (tnamesT a) (tnamesT c))

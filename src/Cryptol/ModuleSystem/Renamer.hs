@@ -14,6 +14,7 @@
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE OverloadedStrings #-}
 module Cryptol.ModuleSystem.Renamer (
     NamingEnv(), shadowing
   , BindsNames(..), InModule(..), namingEnv'
@@ -30,14 +31,14 @@ module Cryptol.ModuleSystem.Renamer (
 import Cryptol.ModuleSystem.Name
 import Cryptol.ModuleSystem.NamingEnv
 import Cryptol.ModuleSystem.Exports
-import Cryptol.Prims.Syntax
 import Cryptol.Parser.AST
 import Cryptol.Parser.Position
-import Cryptol.TypeCheck.Type (TCon(..))
-import Cryptol.Utils.Ident (packInfix,packIdent)
+import Cryptol.Parser.Selector(ppNestedSels,selName)
 import Cryptol.Utils.Panic (panic)
 import Cryptol.Utils.PP
 
+import Data.List(find)
+import Data.Maybe (fromMaybe)
 import qualified Data.Foldable as F
 import           Data.Map.Strict ( Map )
 import qualified Data.Map.Strict as Map
@@ -75,7 +76,7 @@ data RenamerError
     -- ^ When a type is missing from the naming environment, but one or more
     -- values exist with the same name.
 
-  | FixityError (Located Name) (Located Name) NameDisp
+  | FixityError (Located Name) Fixity (Located Name) Fixity NameDisp
     -- ^ When the fixity of two operators conflict
 
   | InvalidConstraint (Type PName) NameDisp
@@ -86,6 +87,9 @@ data RenamerError
 
   | BoundReservedType PName (Maybe Range) Doc NameDisp
     -- ^ When a builtin type is named in a binder.
+
+  | OverlappingRecordUpdate (Located [Selector]) (Located [Selector]) NameDisp
+    -- ^ When record updates overlap (e.g., @{ r | x = e1, x.y = e2 }@)
     deriving (Show, Generic, NFData)
 
 instance PP RenamerError where
@@ -120,11 +124,14 @@ instance PP RenamerError where
          4 (fsep [ text "Expected a type named", quotes (pp (thing lqn))
                  , text "but found a value instead" ])
 
-    FixityError o1 o2 disp -> fixNameDisp disp $
-      hang (text "[error]")
-         4 (fsep [ text "The fixities of", pp o1, text "and", pp o2
-                 , text "are not compatible.  "
-                 , text "You may use explicit parenthesis to disambiguate" ])
+    FixityError o1 f1 o2 f2 disp -> fixNameDisp disp $
+      hang (text "[error] at" <+> pp (srcRange o1) <+> text "and" <+> pp (srcRange o2))
+         4 (fsep [ text "The fixities of"
+                 , nest 2 $ vcat
+                   [ "•" <+> pp (thing o1) <+> parens (pp f1)
+                   , "•" <+> pp (thing o2) <+> parens (pp f2) ]
+                 , text "are not compatible."
+                 , text "You may use explicit parentheses to disambiguate." ])
 
     InvalidConstraint ty disp -> fixNameDisp disp $
       hang (text "[error]" <+> maybe empty (\r -> text "at" <+> pp r) (getLoc ty))
@@ -139,6 +146,11 @@ instance PP RenamerError where
       hang (text "[error]" <+> maybe empty (\r -> text "at" <+> pp r) loc)
          4 (fsep [ text "built-in type", quotes (pp n), text "shadowed in", src ])
 
+    OverlappingRecordUpdate xs ys disp -> fixNameDisp disp $
+      hang "[error] Overlapping record updates:"
+         4 (vcat [ ppLab xs, ppLab ys ])
+      where
+      ppLab as = ppNestedSels (thing as) <+> "at" <+> pp (srcRange as)
 
 -- Warnings --------------------------------------------------------------------
 
@@ -151,9 +163,10 @@ data RenamerWarning
 instance PP RenamerWarning where
   ppPrec _ (SymbolShadowed new originals disp) = fixNameDisp disp $
     hang (text "[warning] at" <+> loc)
-       4 $ fsep [ text "This binding for" <+> sym
-                , (text "shadows the existing binding" <.> plural) <+> text "from" ]
-        $$ vcat (map ppLocName originals)
+       4 $ fsep [ text "This binding for" <+> backticks sym
+                , text "shadows the existing binding" <.> plural <+>
+                  text "at" ]
+        $$ vcat (map (pp . nameLoc) originals)
 
     where
     plural | length originals > 1 = char 's'
@@ -385,6 +398,7 @@ renameModule m =
 instance Rename TopDecl where
   rename td     = case td of
     Decl d      -> Decl      <$> traverse rename d
+    DPrimType d -> DPrimType <$> traverse rename d
     TDNewtype n -> TDNewtype <$> traverse rename n
     Include n   -> return (Include n)
     DParameterFun f  -> DParameterFun  <$> rename f
@@ -396,6 +410,13 @@ renameLocated :: Rename f => Located (f PName) -> RenameM (Located (f Name))
 renameLocated x =
   do y <- rename (thing x)
      return x { thing = y }
+
+instance Rename PrimType where
+  rename pt =
+    do x <- rnLocated renameType (primTName pt)
+       let (as,ps) = primTCts pt
+       (_,cts) <- renameQual as ps $ \as' ps' -> pure (as',ps')
+       pure pt { primTCts = cts, primTName = x }
 
 instance Rename ParameterType where
   rename a =
@@ -520,18 +541,20 @@ instance Rename Schema where
 -- into scope.
 renameSchema :: Schema PName -> RenameM (NamingEnv,Schema Name)
 renameSchema (Forall ps p ty loc) =
-  do -- check that the parameters don't shadow any built-in types
-     let reserved = filter (isReserved . tpName) ps
-         mkErr tp = BoundReservedType (tpName tp) (tpRange tp) (text "schema")
-     unless (null reserved) (mapM_ (record . mkErr) reserved)
+  renameQual ps p $ \ps' p' ->
+    do ty' <- rename ty
+       pure (Forall ps' p' ty' loc)
 
-     env <- liftSupply (namingEnv' ps)
-     s'  <- shadowNames env $ Forall <$> traverse rename ps
-                                     <*> traverse rename p
-                                     <*> rename ty
-                                     <*> pure loc
-
-     return (env,s')
+-- | Rename a qualified thing.
+renameQual :: [TParam PName] -> [Prop PName] ->
+              ([TParam Name] -> [Prop Name] -> RenameM a) ->
+              RenameM (NamingEnv, a)
+renameQual as ps k =
+  do env <- liftSupply (namingEnv' as)
+     res <- shadowNames env $ do as' <- traverse rename as
+                                 ps' <- traverse rename ps
+                                 k as' ps'
+     pure (env,res)
 
 instance Rename TParam where
   rename TParam { .. } =
@@ -539,53 +562,7 @@ instance Rename TParam where
        return TParam { tpName = n, .. }
 
 instance Rename Prop where
-  rename p      = case p of
-    CFin t        -> CFin       <$> rename t
-    CEqual l r    -> CEqual     <$> rename l <*> rename r
-    CNeq l r      -> CNeq       <$> rename l <*> rename r
-    CGeq l r      -> CGeq       <$> rename l <*> rename r
-    CZero t       -> CZero      <$> rename t
-    CLogic t      -> CLogic     <$> rename t
-    CArith t      -> CArith     <$> rename t
-    CCmp t        -> CCmp       <$> rename t
-    CSignedCmp t  -> CSignedCmp <$> rename t
-    CLiteral l r  -> CLiteral   <$> rename l <*> rename r
-    CUser qn ps   -> CUser      <$> renameType qn <*> traverse rename ps
-    CLocated p' r -> withLoc r
-                   $ CLocated <$> rename p' <*> pure r
-
-    -- here, we rename the type and then require that it produces something that
-    -- looks like a Prop
-    CType t -> translateProp =<< resolveTypeFixity t
-
-translateProp :: Type PName -> RenameM (Prop Name)
-translateProp ty = go ty
-  where
-  go t = case t of
-
-    TLocated t' r -> (`CLocated` r) <$> go t'
-
-    TApp (PC x) [l,r]
-      | PEqual <- x -> CEqual <$> rename l <*> rename r
-      | PNeq   <- x -> CNeq   <$> rename l <*> rename r
-      | PGeq   <- x -> CGeq   <$> rename l <*> rename r
-
-    TUser n [l,r]
-      | isLeq n -> CGeq <$> rename r <*> rename l
-
-    TUser n ts -> CUser <$> renameType n <*> traverse rename ts
-
-    -- record an error, but continue renaming to gather any other errors
-    _ ->
-      do record (InvalidConstraint ty)
-         CType <$> rename t
-
-
--- | Check to see if this identifier is a reserved type/type-function.
-isReserved :: PName -> Bool
-isReserved pn = case primTyFromPName pn of
-                  Just _ -> True
-                  _      -> False
+  rename (CType t) = CType <$> rename t
 
 
 -- | Resolve fixity, then rename the resulting type.
@@ -599,14 +576,7 @@ instance Rename Type where
     go (TNum c)      = return (TNum c)
     go (TChar c)     = return (TChar c)
 
-    go (TUser pn ps)
-
-      | Just pt <- primTyFromPName pn =
-        do ps' <- traverse go ps
-           return (TApp (primTyCon pt) ps')
-
     go (TUser qn ps)   = TUser    <$> renameType qn <*> traverse go ps
-    go (TApp f xs)     = TApp f   <$> traverse go xs
     go (TRecord fs)    = TRecord  <$> traverse (rnNamed go) fs
     go (TTuple fs)     = TTuple   <$> traverse go fs
     go  TWild          = return TWild
@@ -629,7 +599,6 @@ resolveTypeFixity  = go
     TFun a b     -> TFun     <$> go a  <*> go b
     TSeq n a     -> TSeq     <$> go n  <*> go a
     TUser pn ps  -> TUser pn <$> traverse go ps
-    TApp f xs    -> TApp f   <$> traverse go xs
     TRecord fs   -> TRecord  <$> traverse (traverse go) fs
     TTuple fs    -> TTuple   <$> traverse go fs
 
@@ -638,7 +607,7 @@ resolveTypeFixity  = go
     TParens t'   -> TParens <$> go t'
 
     TInfix a o _ b ->
-      do let op = lookupFixity o
+      do op <- lookupFixity o
          a' <- go a
          b' <- go b
          mkTInfix a' op b'
@@ -656,11 +625,8 @@ mkTInfix :: Type PName -> (TOp,Fixity) -> Type PName -> RenameM (Type PName)
 mkTInfix t op@(o2,f2) z =
   case t of
     TLocated t1 _ -> mkTInfix t1 op z
-
-    TUser op1 [x,y] | isLeq op1 -> doFixity (TUser op1) leqFixity x y
-    TApp tc [x,y]
-      | Just pt <- primTyFromTC tc
-      , Just f1 <- primTyFixity pt -> doFixity (TApp tc) f1 x y
+    TInfix x ln f1 y ->
+      doFixity (\a b -> TInfix a ln f1 b) f1 x y
 
     _ -> return (o2 t z)
 
@@ -669,7 +635,7 @@ mkTInfix t op@(o2,f2) z =
     case compareFixity f1 f2 of
       FCLeft  -> return (o2 t z)
       FCRight -> do r <- mkTInfix y op z
-                    return (mk [x,r])
+                    return (mk x r)
 
       -- As the fixity table is known, and this is a case where the fixity came
       -- from that table, it's a real error if the fixities didn't work out.
@@ -680,33 +646,14 @@ mkTInfix t op@(o2,f2) z =
 
 -- | When possible, rewrite the type operator to a known constructor, otherwise
 -- return a 'TOp' that reconstructs the original term, and a default fixity.
-lookupFixity :: Located PName -> (TOp,Fixity)
+lookupFixity :: Located PName -> RenameM (TOp, Fixity)
 lookupFixity op =
-  case lkp of
-    Just res -> res
-
-    -- unknown type operator, just use default fixity
-    -- NOTE: this works for the props defined above, as all other operators
-    -- are defined with a higher precedence.
-    Nothing    -> (\x y -> TUser sym [x,y], Fixity NonAssoc 0)
+  do n <- renameType sym
+     let fi = fromMaybe defaultFixity (nameFixity n)
+     return (\x y -> TInfix x op fi y, fi)
 
   where
   sym = thing op
-  lkp = do pt <- primTyFromPName (thing op)
-           fi <- primTyFixity pt
-           return (\x y -> TApp (primTyCon pt) [x,y], fi)
-        `mplus`
-        do guard (isLeq sym)
-           return (\x y -> TUser sym [x,y], leqFixity)
-
-leqFixity :: Fixity
-leqFixity = Fixity NonAssoc 30
-
-leqIdent :: Ident
-leqIdent  = packInfix "<="
-
-isLeq :: PName -> Bool
-isLeq x = getIdent x == leqIdent
 
 
 -- | Rename a binding.
@@ -743,45 +690,100 @@ instance Rename Pattern where
     PLocated p' loc -> withLoc loc
                      $ PLocated <$> rename p'    <*> pure loc
 
+-- | Note that after this point the @->@ updates have an explicit function
+-- and there are no more nested updates.
+instance Rename UpdField where
+  rename (UpdField h ls e) =
+    -- The plan:
+    -- x =  e       ~~~>        x = e
+    -- x -> e       ~~~>        x -> \x -> e
+    -- x.y = e      ~~~>        x -> { _ | y = e }
+    -- x.y -> e     ~~~>        x -> { _ | y -> e }
+    case ls of
+      l : more ->
+       case more of
+         [] -> case h of
+                 UpdSet -> UpdField UpdSet [l] <$> rename e
+                 UpdFun -> UpdField UpdFun [l] <$> rename (EFun [PVar p] e)
+                       where
+                       p = UnQual . selName <$> last ls
+         _ -> UpdField UpdFun [l] <$> rename (EUpd Nothing [ UpdField h more e])
+      [] -> panic "rename@UpdField" [ "Empty label list." ]
+
+
 instance Rename Expr where
   rename expr = case expr of
-    EVar n        -> EVar <$> renameVar n
-    ELit l        -> return (ELit l)
-    ENeg e        -> rename (EApp (EVar (mkUnqual (packIdent "negate"))) e)
-    EComplement e -> rename (EApp (EVar (mkUnqual (packIdent "complement"))) e)
-    ETuple es     -> ETuple  <$> traverse rename es
-    ERecord fs    -> ERecord <$> traverse (rnNamed rename) fs
-    ESel e' s     -> ESel    <$> rename e' <*> pure s
-    EList es      -> EList   <$> traverse rename es
-    EFromTo s n e'-> EFromTo <$> rename s
-                             <*> traverse rename n
-                             <*> traverse rename e'
-    EInfFrom a b  -> EInfFrom<$> rename a  <*> traverse rename b
-    EComp e' bs   -> do arms' <- traverse renameArm bs
-                        let (envs,bs') = unzip arms'
-                        -- NOTE: renameArm will generate shadowing warnings; we only
-                        -- need to check for repeated names across multiple arms
-                        shadowNames' CheckOverlap envs (EComp <$> rename e' <*> pure bs')
-    EApp f x      -> EApp    <$> rename f  <*> rename x
-    EAppT f ti    -> EAppT   <$> rename f  <*> traverse rename ti
-    EIf b t f     -> EIf     <$> rename b  <*> rename t  <*> rename f
-    EWhere e' ds  -> do ns <- getNS
-                        shadowNames (map (InModule ns) ds) $
-                          EWhere <$> rename e' <*> traverse rename ds
-    ETyped e' ty  -> ETyped  <$> rename e' <*> rename ty
-    ETypeVal ty   -> ETypeVal<$> rename ty
-    EFun ps e'    -> do (env,ps') <- renamePats ps
-                        -- NOTE: renamePats will generate warnings, so we don't
-                        -- need to duplicate them here
-                        shadowNames' CheckNone env (EFun ps' <$> rename e')
-    ELocated e' r -> withLoc r
-                   $ ELocated <$> rename e' <*> pure r
+    EVar n          -> EVar <$> renameVar n
+    ELit l          -> return (ELit l)
+    ENeg e          -> ENeg    <$> rename e
+    EComplement e   -> EComplement
+                               <$> rename e
+    EGenerate e     -> EGenerate
+                               <$> rename e
+    ETuple es       -> ETuple  <$> traverse rename es
+    ERecord fs      -> ERecord <$> traverse (rnNamed rename) fs
+    ESel e' s       -> ESel    <$> rename e' <*> pure s
+    EUpd mb fs      -> do checkLabels fs
+                          EUpd <$> traverse rename mb <*> traverse rename fs
+    EList es        -> EList   <$> traverse rename es
+    EFromTo s n e t -> EFromTo <$> rename s
+                               <*> traverse rename n
+                               <*> rename e
+                               <*> traverse rename t
+    EInfFrom a b    -> EInfFrom<$> rename a  <*> traverse rename b
+    EComp e' bs     -> do arms' <- traverse renameArm bs
+                          let (envs,bs') = unzip arms'
+                          -- NOTE: renameArm will generate shadowing warnings; we only
+                          -- need to check for repeated names across multiple arms
+                          shadowNames' CheckOverlap envs (EComp <$> rename e' <*> pure bs')
+    EApp f x        -> EApp    <$> rename f  <*> rename x
+    EAppT f ti      -> EAppT   <$> rename f  <*> traverse rename ti
+    EIf b t f       -> EIf     <$> rename b  <*> rename t  <*> rename f
+    EWhere e' ds    -> do ns <- getNS
+                          shadowNames (map (InModule ns) ds) $
+                            EWhere <$> rename e' <*> traverse rename ds
+    ETyped e' ty    -> ETyped  <$> rename e' <*> rename ty
+    ETypeVal ty     -> ETypeVal<$> rename ty
+    EFun ps e'      -> do (env,ps') <- renamePats ps
+                          -- NOTE: renamePats will generate warnings, so we don't
+                          -- need to duplicate them here
+                          shadowNames' CheckNone env (EFun ps' <$> rename e')
+    ELocated e' r   -> withLoc r
+                     $ ELocated <$> rename e' <*> pure r
 
-    EParens p     -> EParens <$> rename p
-    EInfix x y _ z-> do op <- renameOp y
-                        x' <- rename x
-                        z' <- rename z
-                        mkEInfix x' op z'
+    ESplit e        -> ESplit  <$> rename e
+    EParens p       -> EParens <$> rename p
+    EInfix x y _ z  -> do op <- renameOp y
+                          x' <- rename x
+                          z' <- rename z
+                          mkEInfix x' op z'
+
+
+checkLabels :: [UpdField PName] -> RenameM ()
+checkLabels = foldM_ check [] . map labs
+  where
+  labs (UpdField _ ls _) = ls
+
+  check done l =
+    do case find (overlap l) done of
+         Just l' -> record (OverlappingRecordUpdate (reLoc l) (reLoc l'))
+         Nothing -> pure ()
+       pure (l : done)
+
+  overlap xs ys =
+    case (xs,ys) of
+      ([],_)  -> True
+      (_, []) -> True
+      (x : xs', y : ys') -> same x y && overlap xs' ys'
+
+  same x y =
+    case (thing x, thing y) of
+      (TupleSel a _, TupleSel b _)   -> a == b
+      (ListSel  a _, ListSel  b _)   -> a == b
+      (RecordSel a _, RecordSel b _) -> a == b
+      _                              -> False
+
+  reLoc xs = (head xs) { thing = map thing xs }
 
 
 mkEInfix :: Expr Name             -- ^ May contain infix expressions
@@ -796,7 +798,7 @@ mkEInfix e@(EInfix x o1 f1 y) op@(o2,f2) z =
      FCRight -> do r <- mkEInfix y op z
                    return (EInfix x o1 f1 r)
 
-     FCError -> do record (FixityError o1 o2)
+     FCError -> do record (FixityError o1 f1 o2 f2)
                    return (EInfix e o2 f2 z)
 
 mkEInfix (ELocated e' _) op z =
@@ -809,8 +811,7 @@ mkEInfix e (o,f) z =
 renameOp :: Located PName -> RenameM (Located Name,Fixity)
 renameOp ln = withLoc ln $
   do n  <- renameVar (thing ln)
-     ro <- RenameM ask
-     case Map.lookup n (neFixity (roNames ro)) of
+     case nameFixity n of
        Just fixity -> return (ln { thing = n },fixity)
        Nothing     -> return (ln { thing = n },defaultFixity)
 
@@ -914,9 +915,6 @@ patternEnv  = go
          Just _ -> bindTypes ps
 
          Nothing
-           -- Just ignore reserved names, as they'll be resolved when renaming.
-           | isReserved pn ->
-             bindTypes ps
 
            -- The type isn't bound, and has no parameters, so it names a portion
            -- of the type of the pattern.
@@ -933,7 +931,6 @@ patternEnv  = go
                 n   <- liftSupply (mkParameter (getIdent pn) loc)
                 return (singletonT pn n)
 
-  typeEnv (TApp _ ts)       = bindTypes ts
   typeEnv (TRecord fs)      = bindTypes (map value fs)
   typeEnv (TTuple ts)       = bindTypes ts
   typeEnv TWild             = return mempty
@@ -955,22 +952,18 @@ instance Rename Match where
     MatchLet b -> shadowNamesNS b (MatchLet <$> rename b)
 
 instance Rename TySyn where
-  rename (TySyn n ps ty) =
-    do when (isReserved (thing n))
-            (record (BoundReservedType (thing n) (getLoc n) (text "type synonym")))
-
-       shadowNames ps $ TySyn <$> rnLocated renameType n
-                              <*> traverse rename ps
-                              <*> rename ty
+  rename (TySyn n f ps ty) =
+    shadowNames ps $ TySyn <$> rnLocated renameType n
+                           <*> pure f
+                           <*> traverse rename ps
+                           <*> rename ty
 
 instance Rename PropSyn where
-  rename (PropSyn n ps cs) =
-    do when (isReserved (thing n))
-            (record (BoundReservedType (thing n) (getLoc n) (text "constraint synonym")))
-
-       shadowNames ps $ PropSyn <$> rnLocated renameType n
-                                <*> traverse rename ps
-                                <*> traverse rename cs
+  rename (PropSyn n f ps cs) =
+    shadowNames ps $ PropSyn <$> rnLocated renameType n
+                             <*> pure f
+                             <*> traverse rename ps
+                             <*> traverse rename cs
 
 
 -- Utilities -------------------------------------------------------------------

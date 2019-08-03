@@ -176,6 +176,7 @@ cpo that represents any given schema.
 >         TVTuple etys -> VTuple (zipWith go etys (copyList (genericLength etys) (fromVTuple val)))
 >         TVRec fields -> VRecord [ (f, go fty (lookupRecord f val)) | (f, fty) <- fields ]
 >         TVFun _ bty  -> VFun (\v -> go bty (fromVFun val v))
+>         TVAbstract {} -> val
 >
 > copyStream :: [a] -> [a]
 > copyStream xs = head xs : copyStream (tail xs)
@@ -293,6 +294,7 @@ assigns values to those variables.
 >     ETuple es     -> VTuple [ evalExpr env e | e <- es ]
 >     ERec fields   -> VRecord [ (f, evalExpr env e) | (f, e) <- fields ]
 >     ESel e sel    -> evalSel (evalExpr env e) sel
+>     ESet e sel v  -> evalSet (evalExpr env e) sel (evalExpr env v)
 >
 >     EIf c t f ->
 >       condValue (fromVBit (evalExpr env c)) (evalExpr env t) (evalExpr env f)
@@ -351,6 +353,37 @@ Apply the the given selector form to the given value.
 >         VList _ vs  -> vs !! n
 >         _           -> evalPanic "evalSel"
 >                        ["Unexpected value in list selection."]
+
+
+Update the given value using the given selector and new value.
+
+> evalSet :: Value -> Selector -> Value -> Value
+> evalSet val sel fval =
+>   case sel of
+>     TupleSel n _  -> updTupleAt n
+>     RecordSel n _ -> updRecAt n
+>     ListSel n _   -> updSeqAt n
+>   where
+>     updTupleAt n =
+>       case val of
+>         VTuple vs | (as,_:bs) <- splitAt n vs ->
+>           VTuple (as ++ fval : bs)
+>         _ -> bad "Invalid tuple upldate."
+>
+>     updRecAt n =
+>       case val of
+>         VRecord vs | (as, (i,_) : bs) <- break ((n==) . fst) vs ->
+>           VRecord (as ++ (i,fval) : bs)
+>         _ -> bad "Invalid record update."
+>
+>     updSeqAt n =
+>       case val of
+>         VList i vs | (as, _ : bs) <- splitAt n vs ->
+>           VList i (as ++ fval : bs)
+>         _ -> bad "Invalid sequence update."
+>
+>     bad msg = evalPanic "evalSet" [msg]
+
 
 
 Conditionals
@@ -511,7 +544,7 @@ Cryptol primitives fall into several groups:
 
 * Indexing: `@`, `@@`, `!`, `!!`, `update`, `updateEnd`
 
-* Enumerations: `fromThen`, `fromTo`, `fromThenTo`, `infFrom`, `infFromThen`
+* Enumerations: `fromTo`, `fromThenTo`, `infFrom`, `infFromThen`
 
 * Polynomials: `pmult`, `pdiv`, `pmod`
 
@@ -616,13 +649,6 @@ Cryptol primitives fall into several groups:
 >   , ("updateEnd"  , updatePrim updateBack)
 >
 >   -- Enumerations:
->   , ("fromThen"   , vFinPoly $ \first ->
->                     vFinPoly $ \next  ->
->                     vFinPoly $ \bits  ->
->                     vFinPoly $ \len   ->
->                     VList (Nat len)
->                     (map (vWordValue bits) (genericTake len [first, next ..])))
->
 >   , ("fromTo"     , vFinPoly $ \first ->
 >                     vFinPoly $ \lst   ->
 >                     VPoly    $ \ty  ->
@@ -700,21 +726,11 @@ error if any of the input bits contain an evaluation error.
 > signedBitsToInteger (b0 : bs) = foldl f (if b0 then -1 else 0) bs
 >   where f x b = if b then 2 * x + 1 else 2 * x
 
-Functions `vWord` and `vWordValue` convert from integers back to the
-big-endian bitvector representation. If an integer-producing function
-raises a run-time exception, then the output bitvector will contain
-the exception in all bit positions.
+Function `vWord` converts an integer back to the big-endian bitvector
+representation. If an integer-producing function raises a run-time
+exception, then the output bitvector will contain the exception in all
+bit positions.
 
-> -- | Convert an integer to big-endian binary value of the specified width.
-> vWordValue :: Integer -> Integer -> Value
-> vWordValue w x = VList (Nat w) (map (VBit . Right) (integerToBits w x))
->
-> -- | Convert an integer to a big-endian format of the specified width.
-> integerToBits :: Integer -> Integer -> [Bool]
-> integerToBits w x = go [] w x
->   where go bs 0 _ = bs
->         go bs n a = go (odd a : bs) (n - 1) $! (a `div` 2)
->
 > vWord :: Integer -> Either EvalError Integer -> Value
 > vWord w e = VList (Nat w) [ VBit (fmap (test i) e) | i <- [w-1, w-2 .. 0] ]
 >   where test i x = testBit x (fromInteger i)
@@ -740,6 +756,8 @@ at the same positions.
 >     go (TVTuple tys)  = VTuple (map go tys)
 >     go (TVRec fields) = VRecord [ (f, go fty) | (f, fty) <- fields ]
 >     go (TVFun _ bty)  = VFun (\_ -> go bty)
+>     go (TVAbstract {}) =
+>        evalPanic "logicUnary" ["Abstract type not in `Logic`"]
 >
 > logicUnary :: (Bool -> Bool) -> TValue -> Value -> Value
 > logicUnary op = go
@@ -755,6 +773,8 @@ at the same positions.
 >         TVTuple etys -> VTuple (zipWith go etys (fromVTuple val))
 >         TVRec fields -> VRecord [ (f, go fty (lookupRecord f val)) | (f, fty) <- fields ]
 >         TVFun _ bty  -> VFun (\v -> go bty (fromVFun val v))
+>         TVAbstract {} ->
+>           evalPanic "logicUnary" ["Abstract type not in `Logic`"]
 >
 > logicBinary :: (Bool -> Bool -> Bool) -> TValue -> Value -> Value -> Value
 > logicBinary op = go
@@ -771,6 +791,8 @@ at the same positions.
 >         TVRec fields -> VRecord [ (f, go fty (lookupRecord f l) (lookupRecord f r))
 >                                 | (f, fty) <- fields ]
 >         TVFun _ bty  -> VFun (\v -> go bty (fromVFun l v) (fromVFun r v))
+>         TVAbstract {} ->
+>           evalPanic "logicBinary" ["Abstract type not in `Logic`"]
 
 
 Arithmetic
@@ -808,6 +830,8 @@ up of non-empty finite bitvectors.
 >           VTuple (map go tys)
 >         TVRec fs ->
 >           VRecord [ (f, go fty) | (f, fty) <- fs ]
+>         TVAbstract {} ->
+>           evalPanic "arithNullary" ["Absrat type not in `Arith`"]
 >
 > arithUnary :: (Integer -> Either EvalError Integer)
 >            -> TValue -> Value -> Value
@@ -839,6 +863,8 @@ up of non-empty finite bitvectors.
 >           VTuple (zipWith go tys (fromVTuple val))
 >         TVRec fs ->
 >           VRecord [ (f, go fty (lookupRecord f val)) | (f, fty) <- fs ]
+>         TVAbstract {} ->
+>           evalPanic "arithUnary" ["Absrat type not in `Arith`"]
 >
 > arithBinary :: (Integer -> Integer -> Either EvalError Integer)
 >             -> TValue -> Value -> Value -> Value
@@ -891,6 +917,8 @@ up of non-empty finite bitvectors.
 >           VTuple (zipWith3 go tys (fromVTuple l) (fromVTuple r))
 >         TVRec fs ->
 >           VRecord [ (f, go fty (lookupRecord f l) (lookupRecord f r)) | (f, fty) <- fs ]
+>         TVAbstract {} ->
+>           evalPanic "arithBinary" ["Abstract type not in class `Arith`"]
 
 Signed bitvector division (`/$`) and remainder (`%$`) are defined so
 that division rounds toward zero, and the remainder `x %$ y` has the
@@ -953,6 +981,8 @@ bits to the *left* of that position are equal.
 >           ls     = map snd (sortBy (comparing fst) (fromVRecord l))
 >           rs     = map snd (sortBy (comparing fst) (fromVRecord r))
 >        in lexList (zipWith3 lexCompare tys ls rs)
+>     TVAbstract {} ->
+>       evalPanic "lexCompare" ["Abstract type not in `Cmp`"]
 >
 > lexList :: [Either EvalError Ordering] -> Either EvalError Ordering
 > lexList [] = Right EQ
@@ -1002,6 +1032,8 @@ fields are compared in alphabetical order.
 >           ls     = map snd (sortBy (comparing fst) (fromVRecord l))
 >           rs     = map snd (sortBy (comparing fst) (fromVRecord r))
 >        in lexList (zipWith3 lexSignedCompare tys ls rs)
+>     TVAbstract {} ->
+>       evalPanic "lexSignedCompare" ["Abstract type not in `Cmp`"]
 
 
 Sequences

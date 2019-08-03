@@ -31,7 +31,6 @@ import           Data.Text(Text)
 import qualified Data.Text as T
 import           Control.Monad(liftM2,msum)
 
-import Cryptol.Prims.Syntax(TFun(..))
 import Cryptol.Parser.AST
 import Cryptol.Parser.Position
 import Cryptol.Parser.LexerUtils hiding (mkIdent)
@@ -41,6 +40,14 @@ import Cryptol.Utils.Ident(paramInstModName)
 
 import Paths_cryptol
 }
+
+{- state 196 contains 1 shift/reduce conflicts.
+     `_` identifier conflicts with `_` in record update.
+    We have `_` as an identifier for the cases where we parse types as
+    expressions, for example `[ 12 .. _ ]`.
+-}
+
+%expect 1
 
 
 %token
@@ -74,6 +81,7 @@ import Paths_cryptol
 
   'primitive' { Located $$ (Token (KW KW_primitive) _)}
   'constraint'{ Located $$ (Token (KW KW_constraint) _)}
+  'Prop'      { Located $$ (Token (KW KW_Prop) _)}
 
   '['         { Located $$ (Token (Sym BracketL) _)}
   ']'         { Located $$ (Token (Sym BracketR) _)}
@@ -112,6 +120,7 @@ import Paths_cryptol
   '~'         { Located $$ (Token (Op Complement) _)}
 
   '#'         { Located $$ (Token (Op Hash) _)}
+  '@'         { Located $$ (Token (Op At) _)}
 
   OP          { $$@(Located _ (Token (Op (Other [] _)) _))}
   QOP         { $$@(Located _ (Token (Op  Other{}   )  _))}
@@ -137,19 +146,8 @@ import Paths_cryptol
 {- If you add additional operators, please update the corresponding
    tables in the pretty printer. -}
 
-%nonassoc '=>'
 %right '->'
-%left     'where'
-%nonassoc 'then' 'else'
-%nonassoc ':'
-%nonassoc '=='
-%nonassoc '<=' '>='
 %right '#'
-%left  '+' '-'
-%left  '*' '/' '%'
-%right '^^'
-%right NEG '~'
-%left OP QOP
 %%
 
 
@@ -252,7 +250,7 @@ private_decls           :: { [TopDecl PName] }
 prim_bind               :: { [TopDecl PName] }
   : mbDoc 'primitive' name  ':' schema       { mkPrimDecl $1 $3 $5 }
   | mbDoc 'primitive' '(' op ')' ':' schema  { mkPrimDecl $1 $4 $7 }
-
+  | mbDoc 'primitive' 'type' schema ':' kind {% mkPrimTypeDecl $1 $4 $6 }
 
 
 parameter_decls                      :: { [TopDecl PName] }
@@ -284,17 +282,8 @@ decl                    :: { Decl PName }
   : vars_comma ':' schema  { at (head $1,$3) $ DSignature (reverse $1) $3   }
   | ipat '=' expr          { at ($1,$3) $ DPatBind $1 $3                    }
   | '(' op ')' '=' expr    { at ($1,$5) $ DPatBind (PVar $2) $5             }
-  | var apats '=' expr     { at ($1,$4) $
-                             DBind $ Bind { bName      = $1
-                                          , bParams    = reverse $2
-                                          , bDef       = at $4 (Located emptyRange (DExpr $4))
-                                          , bSignature = Nothing
-                                          , bPragmas   = []
-                                          , bMono      = False
-                                          , bInfix     = False
-                                          , bFixity    = Nothing
-                                          , bDoc       = Nothing
-                                          } }
+  | var apats_indices '=' expr
+                           { at ($1,$4) $ mkIndexedDecl $1 $2 $4 }
 
   | apat pat_op apat '=' expr
                            { at ($1,$5) $
@@ -312,11 +301,15 @@ decl                    :: { Decl PName }
   | 'type' name '=' type   {% at ($1,$4) `fmap` mkTySyn $2 [] $4 }
   | 'type' name tysyn_params '=' type
                            {% at ($1,$5) `fmap` mkTySyn $2 (reverse $3) $5  }
+  | 'type' tysyn_param op tysyn_param '=' type
+                           {% at ($1,$6) `fmap` mkTySyn $3 [$2, $4] $6 }
 
   | 'type' 'constraint' name '=' type
                            {% at ($2,$5) `fmap` mkPropSyn $3 [] $5 }
   | 'type' 'constraint' name tysyn_params '=' type
                            {% at ($2,$6) `fmap` mkPropSyn $3 (reverse $4) $6 }
+  | 'type' 'constraint' tysyn_param op tysyn_param '=' type
+                           {% at ($2,$7) `fmap` mkPropSyn $4 [$3, $5] $7 }
 
   | 'infixl' NUM ops       {% mkFixity LeftAssoc  $2 (reverse $3) }
   | 'infixr' NUM ops       {% mkFixity RightAssoc $2 (reverse $3) }
@@ -325,17 +318,7 @@ decl                    :: { Decl PName }
 
 let_decl                :: { Decl PName }
   : 'let' ipat '=' expr          { at ($2,$4) $ DPatBind $2 $4                    }
-  | 'let' name apats '=' expr    { at ($2,$5) $
-                                   DBind $ Bind { bName      = $2
-                                                , bParams    = reverse $3
-                                                , bDef       = at $5 (Located emptyRange (DExpr $5))
-                                                , bSignature = Nothing
-                                                , bPragmas   = []
-                                                , bMono      = False
-                                                , bInfix     = False
-                                                , bFixity    = Nothing
-                                                , bDoc       = Nothing
-                                                } }
+  | 'let' name apats_indices '=' expr    { at ($2,$5) $ mkIndexedDecl $2 $3 $5 }
 
 newtype                 :: { Newtype PName }
   : 'newtype' qname '=' newtype_body
@@ -355,13 +338,21 @@ var                        :: { LPName }
   : name                      { $1 }
   | '(' op ')'                { $2 }
 
-apats                     :: { [Pattern PName] }
+apats                   :: { [Pattern PName] }
   : apat                   { [$1] }
-  | apats1 apat            { $2 : $1 }
+  | apats apat             { $2 : $1 }
 
-apats1                   :: { [Pattern PName]  }
-  : apat                    { [$1]       }
-  | apats1 apat             { $2 : $1    }
+indices                 :: { [Pattern PName] }
+  : '@' indices1           { $2 }
+  | {- empty -}            { [] }
+
+indices1                :: { [Pattern PName] }
+  : apat                   { [$1] }
+  | indices1 '@' apat      { $3 : $1 }
+
+apats_indices           :: { ([Pattern PName], [Pattern PName]) }
+  : apats indices          { ($1, $2) }
+  | '@' indices1           { ([], $2) }
 
 decls                   :: { [Decl PName] }
   : decl ';'               { [$1] }
@@ -380,43 +371,9 @@ repl                    :: { ReplInput PName }
   : expr                   { ExprInput $1 }
   | let_decl               { LetInput $1 }
 
+
 --------------------------------------------------------------------------------
--- if a then b else c : [10]
-
-
-expr                             :: { Expr PName }
-  : cexpr                           { $1 }
-  | expr 'where' '{' '}'            { at ($1,$4) $ EWhere $1 []           }
-  | expr 'where' '{' decls '}'      { at ($1,$5) $ EWhere $1 (reverse $4) }
-  | expr 'where' 'v{' 'v}'          { at ($1,$2) $ EWhere $1 []           }
-  | expr 'where' 'v{' vdecls 'v}'   { at ($1,$4) $ EWhere $1 (reverse $4) }
-  | error                           {% expected "an expression" }
-
-ifBranches                       :: { [(Expr PName, Expr PName)] }
-  : ifBranch                        { [$1] }
-  | ifBranches '|' ifBranch         { $3 : $1 }
-
-ifBranch                         :: { (Expr PName, Expr PName) }
-  : expr 'then' expr                { ($1, $3) }
-
-cexpr                            :: { Expr PName }
-  : sig_expr                        { $1 }
-  | 'if' ifBranches 'else' cexpr    { at ($1,$4) $ mkIf (reverse $2) $4 }
-  | '\\' apats '->' cexpr           { at ($1,$4) $ EFun (reverse $2) $4 }
-
-sig_expr                         :: { Expr PName }
-  : iexpr                           { $1 }
-  | iexpr ':' type                  { at ($1,$3) $ ETyped $1 $3 }
-
-iexpr                            :: { Expr PName }
-  : expr10                          { $1 }
-  | iexpr qop expr10                { binOp $1 $2 $3 }
-
-expr10                           :: { Expr PName }
-  : aexprs                          { mkEApp $1 }
-
-  | '-' expr10 %prec NEG            { at ($1,$2) $ ENeg $2 }
-  | '~' expr10                      { at ($1,$2) $ EComplement $2 }
+-- Operators
 
 qop                              :: { LPName }
   : op                              { $1 }
@@ -426,6 +383,7 @@ qop                              :: { LPName }
 op                               :: { LPName }
   : pat_op                          { $1 }
   | '#'                             { Located $1 $ mkUnqual $ mkInfix "#" }
+  | '@'                             { Located $1 $ mkUnqual $ mkInfix "@" }
 
 pat_op                           :: { LPName }
   : other_op                        { $1 }
@@ -442,39 +400,111 @@ other_op                         :: { LPName }
   : OP                              { let Token (Op (Other [] str)) _ = thing $1
                                        in mkUnqual (mkInfix str) A.<$ $1 }
 
-
 ops                     :: { [LPName] }
   : op                     { [$1] }
   | ops ',' op             { $3 : $1 }
 
+
+
+--------------------------------------------------------------------------------
+-- Expressions
+
+
+expr                          :: { Expr PName }
+  : exprNoWhere                  { $1 }
+  | expr 'where' whereClause     { at ($1,$3) (EWhere $1 (thing $3)) }
+
+-- | An expression without a `where` clause
+exprNoWhere                    :: { Expr PName }
+  : simpleExpr qop longRHS        { at ($1,$3) (binOp $1 $2 $3) }
+  | longRHS                       { $1 }
+  | typedExpr                     { $1 }
+
+whereClause                    :: { Located [Decl PName] }
+  : '{' '}'                       { Located (rComb $1 $2) [] }
+  | '{' decls '}'                 { Located (rComb $1 $3) (reverse $2) }
+  | 'v{' 'v}'                     { Located (rComb $1 $2) [] }
+  | 'v{' vdecls 'v}'              { let l2 = fromMaybe $3 (getLoc $2)
+                                    in Located (rComb $1 l2) (reverse $2) }
+
+-- An expression with a type annotation
+typedExpr                      :: { Expr PName }
+  : simpleExpr ':' type           { at ($1,$3) (ETyped $1 $3) }
+
+-- A possibly infix expression (no where, no long application, no type annot)
+simpleExpr                     :: { Expr PName }
+  : simpleExpr qop simpleRHS      { at ($1,$3) (binOp $1 $2 $3) }
+  | simpleRHS                     { $1 }
+
+-- An expression without an obvious end marker
+longExpr                       :: { Expr PName }
+  : 'if' ifBranches 'else' exprNoWhere   { at ($1,$4) $ mkIf (reverse $2) $4 }
+  | '\\' apats '->' exprNoWhere          { at ($1,$4) $ EFun (reverse $2) $4 }
+
+ifBranches                     :: { [(Expr PName, Expr PName)] }
+  : ifBranch                      { [$1] }
+  | ifBranches '|' ifBranch       { $3 : $1 }
+
+ifBranch                       :: { (Expr PName, Expr PName) }
+  : expr 'then' expr              { ($1, $3) }
+
+simpleRHS                      :: { Expr PName }
+  : '-' simpleApp                 { at ($1,$2) (ENeg $2) }
+  | '~' simpleApp                 { at ($1,$2) (EComplement $2) }
+  | simpleApp                     { $1 }
+
+longRHS                        :: { Expr PName }
+  : '-' longApp                   { at ($1,$2) (ENeg $2) }
+  | '~' longApp                   { at ($1,$2) (EComplement $2) }
+  | longApp                       { $1 }
+
+
+-- Prefix application expression, ends with an atom.
+simpleApp                      :: { Expr PName }
+  : aexprs                        { mkEApp $1 }
+
+-- Prefix application expression, may end with a long expression
+longApp                        :: { Expr PName }
+  : simpleApp longExpr            { at ($1,$2) (EApp $1 $2) }
+  | longExpr                      { $1 }
+  | simpleApp                     { $1 }
+
 aexprs                         :: { [Expr PName] }
-  : aexpr                         { [$1]    }
+  : aexpr                         { [$1] }
   | aexprs aexpr                  { $2 : $1 }
 
-aexpr                          :: { Expr PName                             }
+
+-- Expression atom (needs no parens)
+aexpr                          :: { Expr PName }
+  : no_sel_aexpr                  { $1 }
+  | sel_expr                      { $1 }
+
+no_sel_aexpr                   :: { Expr PName                             }
   : qname                         { at $1 $ EVar (thing $1)                }
 
   | NUM                           { at $1 $ numLit (tokenType (thing $1))  }
   | STRLIT                        { at $1 $ ELit $ ECString $ getStr $1    }
   | CHARLIT                       { at $1 $ ELit $ ECNum (getNum $1) CharLit }
+  | '_'                           { at $1 $ EVar $ mkUnqual $ mkIdent "_" }
 
   | '(' expr ')'                  { at ($1,$3) $ EParens $2                }
   | '(' tuple_exprs ')'           { at ($1,$3) $ ETuple (reverse $2)       }
   | '(' ')'                       { at ($1,$2) $ ETuple []                 }
   | '{' '}'                       { at ($1,$2) $ ERecord []                }
-  | '{' field_exprs '}'           { at ($1,$3) $ ERecord (reverse $2)      }
+  | '{' rec_expr '}'              { at ($1,$3) $2                          }
   | '[' ']'                       { at ($1,$2) $ EList []                  }
   | '[' list_expr  ']'            { at ($1,$3) $2                          }
   | '`' tick_ty                   { at ($1,$2) $ ETypeVal $2               }
-  | aexpr '.' selector            { at ($1,$3) $ ESel $1 (thing $3)        }
 
   | '(' qop ')'                   { at ($1,$3) $ EVar $ thing $2           }
 
   | '<|'            '|>'          {% mkPoly (rComb $1 $2) [] }
   | '<|' poly_terms '|>'          {% mkPoly (rComb $1 $3) $2 }
 
+sel_expr                       :: { Expr PName }
+  : no_sel_aexpr '.' selector     { at ($1,$3) $ ESel $1 (thing $3)        }
+  | sel_expr '.' selector         { at ($1,$3) $ ESel $1 (thing $3)        }
 
-  -- | error                           {%^ customError "expr" }
 
 poly_terms                     :: { [(Bool, Integer)] }
   : poly_term                     { [$1] }
@@ -494,11 +524,29 @@ tuple_exprs                    :: { [Expr PName] }
   : expr ',' expr                 { [ $3, $1] }
   | tuple_exprs ',' expr          { $3 : $1   }
 
-field_expr             :: { Named (Expr PName) }
-  : ident '=' expr        { Named { name = $1, value = $3 } }
-  | ident apats '=' expr  { Named { name = $1, value = EFun (reverse $2) $4 } }
 
-field_exprs                    :: { [Named (Expr PName)] }
+rec_expr :: { Expr PName }
+  : aexpr '|' field_exprs         { EUpd (Just $1) (reverse $3) }
+  | '_'   '|' field_exprs         { EUpd Nothing   (reverse $3) }
+  | field_exprs                   {% do { xs <- mapM ufToNamed $1;
+                                          pure (ERecord (reverse xs)) } }
+
+field_expr             :: { UpdField PName }
+  : selector field_how expr     { UpdField $2 [$1] $3 }
+  | sels field_how expr         { UpdField $2 $1 $3 }
+  | sels apats_indices field_how expr
+                                { UpdField $3 $1 (mkIndexedExpr $2 $4) }
+  | selector apats_indices field_how expr
+                                { UpdField $3 [$1] (mkIndexedExpr $2 $4) }
+
+field_how :: { UpdHow }
+  : '='                          { UpdSet }
+  | '->'                         { UpdFun }
+
+sels :: { [ Located Selector ] }
+  : sel_expr                      {% selExprToSels $1 }
+
+field_exprs                    :: { [UpdField PName] }
   : field_expr                    { [$1]    }
   | field_exprs ',' field_expr    { $3 : $1 }
 
@@ -513,13 +561,11 @@ list_expr                      :: { Expr PName }
      is being parsed.  For this reason, we use `expr` temporarily and
      then convert it to the corresponding type in the AST. -}
 
-  | expr          '..'            {% eFromTo $2 $1 Nothing   Nothing    }
-  | expr          '..' expr       {% eFromTo $2 $1 Nothing   (Just $3)  }
-  | expr ',' expr '..'            {% eFromTo $4 $1 (Just $3) Nothing    }
-  | expr ',' expr '..' expr       {% eFromTo $4 $1 (Just $3) (Just $5)  }
+  | expr          '..' expr       {% eFromTo $2 $1 Nothing   $3 }
+  | expr ',' expr '..' expr       {% eFromTo $4 $1 (Just $3) $5 }
 
-  | expr '...'                    { EInfFrom $1 Nothing                 }
-  | expr ',' expr '...'           { EInfFrom $1 (Just $3)               }
+  | expr '...'                    { EInfFrom $1 Nothing         }
+  | expr ',' expr '...'           { EInfFrom $1 (Just $3)       }
 
 
 list_alts                      :: { [[Match PName]] }
@@ -580,12 +626,17 @@ schema_vars                    :: { Located [TParam PName] }
   | '{' schema_params '}'         { Located (rComb $1 $3) (reverse $2) }
 
 schema_quals                   :: { Located [Prop PName] }
+  : schema_quals schema_qual      { at ($1,$2) $ fmap (++ thing $2) $1 }
+  | schema_qual                   { $1 }
+
+schema_qual                    :: { Located [Prop PName] }
   : type '=>'                     {% fmap (\x -> at (x,$2) x) (mkProp $1) }
 
-kind                             :: { Located Kind      }
-  : '#'                             { Located $1 KNum   }
-  | '*'                             { Located $1 KType  }
-  | kind '->' kind                  { combLoc KFun $1 $3 }
+kind                           :: { Located Kind      }
+  : '#'                           { Located $1 KNum   }
+  | '*'                           { Located $1 KType  }
+  | 'Prop'                        { Located $1 KProp  }
+  | kind '->' kind                { combLoc KFun $1 $3 }
 
 schema_param                   :: { TParam PName }
   : ident                         {% mkTParam $1 Nothing           }
@@ -603,19 +654,15 @@ tysyn_params                  :: { [TParam PName]  }
   : tysyn_param                  { [$1]      }
   | tysyn_params tysyn_param     { $2 : $1   }
 
-type                           :: { Type PName                                                 }
-  : app_type '->' type            { at ($1,$3) $ TFun $1 $3                                    }
-  | type op app_type              { at ($1,$3) $ TInfix $1 $2 defaultFixity $3 }
-  | app_type                      { $1                                                         }
+type                           :: { Type PName              }
+  : infix_type '->' type          { at ($1,$3) $ TFun $1 $3 }
+  | infix_type                    { $1                      }
+
+infix_type                     :: { Type PName }
+  : infix_type op app_type        { at ($1,$3) $ TInfix $1 $2 defaultFixity $3 }
+  | app_type                      { $1                                         }
 
 app_type                       :: { Type PName }
-  -- : 'lg2'   atype                 { at ($1,$2) $ TApp TCLg2   [$2]    }
-  -- | 'lengthFromThen' atype atype  { at ($1,$3) $ TApp TCLenFromThen [$2,$3] }
-  -- | 'lengthFromThenTo' atype atype
-  --                      atype      { at ($1,$4) $ TApp TCLenFromThen [$2,$3,$4] }
-  -- | 'min'   atype atype           { at ($1,$3) $ TApp TCMin   [$2,$3] }
-  -- | 'max'   atype atype           { at ($1,$3) $ TApp TCMax   [$2,$3] }
-
   : dimensions atype              { at ($1,$2) $ foldr TSeq $2 (reverse (thing $1)) }
   | qname atypes                  { at ($1,head $2)
                                      $ TUser (thing $1) (reverse $2) }
@@ -623,6 +670,7 @@ app_type                       :: { Type PName }
 
 atype                          :: { Type PName }
   : qname                         { at $1 $ TUser (thing $1) []        }
+  | '(' qop ')'                   { at $1 $ TUser (thing $2) []        }
   | NUM                           { at $1 $ TNum  (getNum $1)          }
   | CHARLIT                       { at $1 $ TChar (toEnum $ fromInteger
                                                           $ getNum $1) }
@@ -657,7 +705,7 @@ field_types                    :: { [Named (Type PName)] }
 ident              :: { Located Ident }
   : IDENT             { let Token (Ident _ str) _ = thing $1
                          in $1 { thing = mkIdent str } }
-  | 'x'               { Located { srcRange = $1, thing = mkIdent "x" }}
+  | 'x'               { Located { srcRange = $1, thing = mkIdent "x" } }
   | 'private'         { Located { srcRange = $1, thing = mkIdent "private" } }
   | 'as'              { Located { srcRange = $1, thing = mkIdent "as" } }
   | 'hiding'          { Located { srcRange = $1, thing = mkIdent "hiding" } }

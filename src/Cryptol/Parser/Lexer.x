@@ -121,6 +121,8 @@ $white+                   { emit $ White Space }
 "parameter"               { emit $ KW KW_parameter }
 "constraint"              { emit $ KW KW_constraint }
 
+"Prop"                    { emit $ KW KW_Prop }
+
 @num2                     { emitS (numToken 2  . Text.drop 2) }
 @num8                     { emitS (numToken 8  . Text.drop 2) }
 @num10                    { emitS (numToken 10 . Text.drop 0) }
@@ -163,6 +165,9 @@ $white+                   { emit $ White Space }
 
 -- hash is used as a kind, and as a pattern
 "#"                       { emit  (Op   Hash ) }
+
+-- at-sign is used in declaration bindings
+"@"                       { emit  (Op   At   ) }
 
 -- ~ is used for unary complement
 "~"                       { emit  (Op   Complement) }
@@ -240,7 +245,7 @@ primLexer cfg cs = run inp Normal
           , alexPos i')
       AlexSkip i' _ -> run i' s
       AlexToken i' l act ->
-        let txt         = Text.take (fromIntegral l) (input i)
+        let txt         = Text.take l (input i)
             (mtok,s')   = act cfg (alexPos i) txt s
             (rest,pos)  = run i' $! s'
         in case mtok of

@@ -37,8 +37,9 @@ checkModuleInstance func inst =
                                 -- the full dependencies, the actual imports
                                 -- might be ambiguous, but that shouldn't
                                 -- matters as names have been already resolved
-                   , mTySyns         = Map.union (mTySyns inst) (mTySyns m)
-                   , mNewtypes       = Map.union (mNewtypes inst) (mNewtypes m)
+                   , mTySyns      = Map.union (mTySyns inst) (mTySyns m)
+                   , mNewtypes    = Map.union (mNewtypes inst) (mNewtypes m)
+                   , mPrimTypes   = Map.union (mPrimTypes inst) (mPrimTypes m)
                    , mParamTypes       = mParamTypes inst
                    , mParamConstraints = mParamConstraints inst
                    , mParamFuns        = mParamFuns inst
@@ -88,7 +89,7 @@ checkTyParams func inst =
        unless (k1 == k2) (recordError (KindMismatch k1 k2))
 
        let nm  = tsName ts
-           src = CtPartialTypeFun (UserTyFun nm)
+           src = CtPartialTypeFun nm
        mapM_ (newGoal src) (tsConstraints ts)
 
        return (tp, TUser nm [] (tsDef ts))
@@ -106,7 +107,7 @@ checkTyParams func inst =
        unless (k1 == k2) (recordError (KindMismatch k1 k2))
 
        let nm = ntName nt
-           src = CtPartialTypeFun (UserTyFun nm)
+           src = CtPartialTypeFun nm
        mapM_ (newGoal src) (ntConstraints nt)
 
        return (tp, TCon (TC (TCNewtype (UserTC nm k2))) [])

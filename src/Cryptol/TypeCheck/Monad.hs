@@ -61,6 +61,7 @@ data InferInput = InferInput
   , inpVars      :: Map Name Schema   -- ^ Variables that are in scope
   , inpTSyns     :: Map Name TySyn    -- ^ Type synonyms that are in scope
   , inpNewtypes  :: Map Name Newtype  -- ^ Newtypes in scope
+  , inpAbstractTypes :: Map Name AbstractType -- ^ Abstract types in scope
 
     -- When typechecking a module these start off empty.
     -- We need them when type-checking an expression at the command
@@ -121,6 +122,7 @@ runInferM info (IM m) = SMT.withSolver (inpSolverConfig info) $ \solver ->
                          , iTVars         = []
                          , iTSyns         = fmap mkExternal (inpTSyns info)
                          , iNewtypes      = fmap mkExternal (inpNewtypes info)
+                         , iAbstractTypes = mkExternal <$> inpAbstractTypes info
                          , iParamTypes    = inpParamTypes info
                          , iParamFuns     = inpParamFuns info
                          , iParamConstraints = inpParamConstraints info
@@ -202,6 +204,7 @@ data RO = RO
    -- So, either a type-synonym shadows a newtype, or it was declared
    -- at the top-level, but then there can't be a newtype with the
    -- same name (this should be caught by the renamer).
+  , iAbstractTypes :: Map Name (DefLoc, AbstractType)
 
   , iParamTypes :: Map Name ModTParam
     -- ^ Parameter types
@@ -213,7 +216,7 @@ data RO = RO
     -- ^ Parameter functions
 
 
-  , iSolvedHasLazy :: Map Int (Expr -> Expr)
+  , iSolvedHasLazy :: Map Int HasGoalSln
     -- ^ NOTE: This field is lazy in an important way!  It is the
     -- final version of `iSolvedHas` in `RW`, and the two are tied
     -- together through recursion.  The field is here so that we can
@@ -251,7 +254,7 @@ data RW = RW
     --     3. it is an error if we encounter an existential variable but we
     --        have no current scope.
 
-  , iSolvedHas :: Map Int (Expr -> Expr)
+  , iSolvedHas :: Map Int HasGoalSln
     -- ^ Selector constraints that have been solved (ref. iSolvedSelectorsLazy)
 
   -- Generating names
@@ -403,7 +406,7 @@ which we are selecting (i.e., the record or tuple).  Plese note
 that the resulting expression should not be forced before the
 constraint is solved.
 -}
-newHasGoal :: P.Selector -> Type -> Type -> InferM (Expr -> Expr)
+newHasGoal :: P.Selector -> Type -> Type -> InferM HasGoalSln
 newHasGoal l ty f =
   do goalName <- newGoalName
      g        <- newGoal CtSelector (pHas l ty f)
@@ -412,6 +415,7 @@ newHasGoal l ty f =
      return $ case Map.lookup goalName solns of
                 Just e1 -> e1
                 Nothing -> panic "newHasGoal" ["Unsolved has goal in result"]
+
 
 -- | Add a previously generate has constrained
 addHasGoal :: HasGoal -> InferM ()
@@ -424,7 +428,7 @@ getHasGoals = do gs <- IM $ sets $ \s -> (iHasCts s, s { iHasCts = [] })
                  applySubst gs
 
 -- | Specify the solution (`Expr -> Expr`) for the given constraint (`Int`).
-solveHasGoal :: Int -> (Expr -> Expr) -> InferM ()
+solveHasGoal :: Int -> HasGoalSln -> InferM ()
 solveHasGoal n e =
   IM $ sets_ $ \s -> s { iSolvedHas = Map.insert n e (iSolvedHas s) }
 
@@ -614,6 +618,9 @@ lookupTSyn x = fmap (fmap snd . Map.lookup x) getTSyns
 lookupNewtype :: Name -> InferM (Maybe Newtype)
 lookupNewtype x = fmap (fmap snd . Map.lookup x) getNewtypes
 
+lookupAbstractType :: Name -> InferM (Maybe AbstractType)
+lookupAbstractType x = fmap (fmap snd . Map.lookup x) getAbstractTypes
+
 -- | Lookup the kind of a parameter type
 lookupParamType :: Name -> InferM (Maybe ModTParam)
 lookupParamType x = Map.lookup x <$> getParamTypes
@@ -636,6 +643,7 @@ existVar x k =
            [] ->
               do recordError $ ErrorMsg
                              $ text "Undefined type" <+> quotes (pp x)
+                                    <+> text (show x)
                  newType TypeErrorPlaceHolder k
 
            sc : more ->
@@ -651,6 +659,10 @@ getTSyns = IM $ asks iTSyns
 -- | Returns the newtype declarations that are in scope.
 getNewtypes :: InferM (Map Name (DefLoc,Newtype))
 getNewtypes = IM $ asks iNewtypes
+
+-- | Returns the abstract type declarations that are in scope.
+getAbstractTypes :: InferM (Map Name (DefLoc,AbstractType))
+getAbstractTypes = IM $ asks iAbstractTypes
 
 -- | Returns the parameter functions declarations
 getParamFuns :: InferM (Map Name ModVParam)
@@ -732,6 +744,14 @@ withNewtype t (IM m) =
   IM $ mapReader
         (\r -> r { iNewtypes = Map.insert (ntName t) (IsLocal,t)
                                                      (iNewtypes r) }) m
+
+withPrimType :: AbstractType -> InferM a -> InferM a
+withPrimType t (IM m) =
+  IM $ mapReader
+      (\r -> r { iAbstractTypes = Map.insert (atName t) (IsLocal,t)
+                                                        (iAbstractTypes r) }) m
+
+
 withParamType :: ModTParam -> InferM a -> InferM a
 withParamType a (IM m) =
   IM $ mapReader
@@ -869,6 +889,9 @@ kRecordError e = kInInferM $ recordError e
 kRecordWarning :: Warning -> KindM ()
 kRecordWarning w = kInInferM $ recordWarning w
 
+kIO :: IO a -> KindM a
+kIO m = KM $ lift $ lift $ io m
+
 -- | Generate a fresh unification variable of the given kind.
 -- NOTE:  We do not simplify these, because we end up with bottom.
 -- See `Kind.hs`
@@ -889,6 +912,9 @@ kLookupNewtype x = kInInferM $ lookupNewtype x
 
 kLookupParamType :: Name -> KindM (Maybe ModTParam)
 kLookupParamType x = kInInferM (lookupParamType x)
+
+kLookupAbstractType :: Name -> KindM (Maybe AbstractType)
+kLookupAbstractType x = kInInferM $ lookupAbstractType x
 
 kExistTVar :: Name -> Kind -> KindM Type
 kExistTVar x k = kInInferM $ existVar x k

@@ -71,7 +71,7 @@ import qualified Cryptol.TypeCheck.Parseable as T
 import qualified Cryptol.TypeCheck.Subst as T
 import           Cryptol.TypeCheck.Solve(defaultReplExpr)
 import qualified Cryptol.TypeCheck.Solver.SMT as SMT
-import Cryptol.TypeCheck.PP (dump)
+import Cryptol.TypeCheck.PP (dump,ppWithNames,emptyNameMap,backticks)
 import Cryptol.Utils.PP
 import Cryptol.Utils.Panic(panic)
 import qualified Cryptol.Parser.AST as P
@@ -81,21 +81,26 @@ import qualified Cryptol.Symbolic as Symbolic
 
 import qualified Control.Exception as X
 import Control.Monad hiding (mapM, mapM)
+import Control.Monad.IO.Class(liftIO)
+import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Char8 as BS8
 import Data.Bits ((.&.))
-import Data.Char (isSpace,isPunctuation,isSymbol)
+import Data.Char (isSpace,isPunctuation,isSymbol,isAlphaNum,isAscii)
 import Data.Function (on)
-import Data.List (intercalate, nub, sortBy, partition, isPrefixOf)
-import Data.Maybe (fromMaybe,mapMaybe)
+import Data.List (intercalate, nub, sortBy, partition, isPrefixOf,intersperse)
+import Data.Maybe (fromMaybe,mapMaybe,isNothing)
 import System.Environment (lookupEnv)
 import System.Exit (ExitCode(ExitSuccess))
 import System.Process (shell,createProcess,waitForProcess)
 import qualified System.Process as Process(runCommand)
 import System.FilePath((</>), isPathSeparator)
-import System.Directory(getHomeDirectory,setCurrentDirectory,doesDirectoryExist)
+import System.Directory(getHomeDirectory,setCurrentDirectory,doesDirectoryExist
+                       ,getTemporaryDirectory,setPermissions,removeFile
+                       ,emptyPermissions,setOwnerReadable)
 import qualified Data.Map as Map
 import qualified Data.Set as Set
-import System.IO(hFlush,stdout)
+import System.IO(hFlush,stdout,openTempFile,hClose)
 import System.Random.TF(newTFGen)
 import Numeric (showFFloat)
 import qualified Data.Text as T
@@ -121,6 +126,7 @@ data Command
 -- | Command builder.
 data CommandDescr = CommandDescr
   { cNames  :: [String]
+  , cArgs   :: [String]
   , cBody   :: CommandBody
   , cHelp   :: String
   }
@@ -168,53 +174,59 @@ nbCommands  = foldl insert emptyTrie nbCommandList
 -- | A subset of commands safe for Notebook execution
 nbCommandList :: [CommandDescr]
 nbCommandList  =
-  [ CommandDescr [ ":t", ":type" ] (ExprArg typeOfCmd)
+  [ CommandDescr [ ":t", ":type" ] ["EXPR"] (ExprArg typeOfCmd)
     "Check the type of an expression."
-  , CommandDescr [ ":b", ":browse" ] (ModNameArg browseCmd)
+  , CommandDescr [ ":b", ":browse" ] ["[ MODULE ]"] (ModNameArg browseCmd)
     "Display environment for all loaded modules, or for a specific module."
-  , CommandDescr [ ":?", ":help" ] (HelpArg helpCmd)
+  , CommandDescr [ ":?", ":help" ] ["[ TOPIC ]"] (HelpArg helpCmd)
     "Display a brief description of a function, type, or command."
-  , CommandDescr [ ":s", ":set" ] (OptionArg setOptionCmd)
+  , CommandDescr [ ":s", ":set" ] ["[ OPTION [ = VALUE ] ]"] (OptionArg setOptionCmd)
     "Set an environmental option (:set on its own displays current values)."
-  , CommandDescr [ ":check" ] (ExprArg (void . qcCmd QCRandom))
+  , CommandDescr [ ":check" ] ["[ EXPR ]"] (ExprArg (void . qcCmd QCRandom))
     "Use random testing to check that the argument always returns true.\n(If no argument, check all properties.)"
-  , CommandDescr [ ":exhaust" ] (ExprArg (void . qcCmd QCExhaust))
+  , CommandDescr [ ":exhaust" ] ["[ EXPR ]"] (ExprArg (void . qcCmd QCExhaust))
     "Use exhaustive testing to prove that the argument always returns\ntrue. (If no argument, check all properties.)"
-  , CommandDescr [ ":prove" ] (ExprArg proveCmd)
+  , CommandDescr [ ":prove" ] ["[ EXPR ]"] (ExprArg proveCmd)
     "Use an external solver to prove that the argument always returns\ntrue. (If no argument, check all properties.)"
-  , CommandDescr [ ":sat" ] (ExprArg satCmd)
+  , CommandDescr [ ":sat" ] ["[ EXPR ]"] (ExprArg satCmd)
     "Use a solver to find a satisfying assignment for which the argument\nreturns true. (If no argument, find an assignment for all properties.)"
-  , CommandDescr [ ":debug_specialize" ] (ExprArg specializeCmd)
+  , CommandDescr [ ":debug_specialize" ] ["EXPR"](ExprArg specializeCmd)
     "Do type specialization on a closed expression."
-  , CommandDescr [ ":eval" ] (ExprArg refEvalCmd)
+  , CommandDescr [ ":eval" ] ["EXPR"] (ExprArg refEvalCmd)
     "Evaluate an expression with the reference evaluator."
-  , CommandDescr [ ":ast" ] (ExprArg astOfCmd)
+  , CommandDescr [ ":ast" ] ["EXPR"] (ExprArg astOfCmd)
     "Print out the pre-typechecked AST of a given term."
-  , CommandDescr [ ":extract-coq" ] (NoArg allTerms)
+  , CommandDescr [ ":extract-coq" ] [] (NoArg allTerms)
     "Print out the post-typechecked AST of all currently defined terms,\nin a Coq-parseable format."
   ]
 
 commandList :: [CommandDescr]
 commandList  =
   nbCommandList ++
-  [ CommandDescr [ ":q", ":quit" ] (NoArg quitCmd)
+  [ CommandDescr [ ":q", ":quit" ] [] (NoArg quitCmd)
     "Exit the REPL."
-  , CommandDescr [ ":l", ":load" ] (FilenameArg loadCmd)
+  , CommandDescr [ ":l", ":load" ] ["FILE"] (FilenameArg loadCmd)
     "Load a module by filename."
-  , CommandDescr [ ":r", ":reload" ] (NoArg reloadCmd)
+  , CommandDescr [ ":r", ":reload" ] [] (NoArg reloadCmd)
     "Reload the currently loaded module."
-  , CommandDescr [ ":e", ":edit" ] (FilenameArg editCmd)
-    "Edit the currently loaded module."
-  , CommandDescr [ ":!" ] (ShellArg runShellCmd)
+  , CommandDescr [ ":e", ":edit" ] ["[ FILE ]"] (FilenameArg editCmd)
+    "Edit FILE or the currently loaded module."
+  , CommandDescr [ ":!" ] ["COMMAND"] (ShellArg runShellCmd)
     "Execute a command in the shell."
-  , CommandDescr [ ":cd" ] (FilenameArg cdCmd)
+  , CommandDescr [ ":cd" ] ["DIR"] (FilenameArg cdCmd)
     "Set the current working directory."
-  , CommandDescr [ ":m", ":module" ] (FilenameArg moduleCmd)
+  , CommandDescr [ ":m", ":module" ] ["[ MODULE ]"] (FilenameArg moduleCmd)
     "Load a module by its name."
-  , CommandDescr [ ":w", ":writeByteArray" ] (FileExprArg writeFileCmd)
+  , CommandDescr [ ":w", ":writeByteArray" ] ["FILE", "EXPR"] (FileExprArg writeFileCmd)
     "Write data of type 'fin n => [n][8]' to a file."
-  , CommandDescr [ ":readByteArray" ] (FilenameArg readFileCmd)
+  , CommandDescr [ ":readByteArray" ] ["FILE"] (FilenameArg readFileCmd)
     "Read data from a file as type 'fin n => [n][8]', binding\nthe value to variable 'it'."
+  , CommandDescr [ ":dumptests" ] ["FILE", "EXPR"] (FileExprArg dumpTestsCmd)
+    (unlines [ "Dump a tab-separated collection of tests for the given"
+             , "expression into a file. The first column in each line is"
+             , "the expected output, and the remainder are the inputs. The"
+             , "number of tests is determined by the \"tests\" option."
+             ])
   ]
 
 genHelp :: [CommandDescr] -> [String]
@@ -295,6 +307,27 @@ printCounterexample isSat pexpr vs =
      let doc = ppPrec 3 pexpr -- function application has precedence 3
      rPrint $ hang doc 2 (sep docs) <+>
        text (if isSat then "= True" else "= False")
+
+dumpTestsCmd :: FilePath -> String -> REPL ()
+dumpTestsCmd outFile str =
+  do expr <- replParseExpr str
+     (val, ty) <- replEvalExpr expr
+     evo <- getEvalOpts
+     ppopts <- getPPValOpts
+     testNum <- getKnownUser "tests" :: REPL Int
+     g <- io newTFGen
+     tests <- io $ TestR.returnTests g evo ty val testNum
+     out <- forM tests $
+            \(args, x) ->
+              do argOut <- mapM (rEval . E.ppValue ppopts) args
+                 resOut <- rEval (E.ppValue ppopts x)
+                 return (renderOneLine resOut ++ "\t" ++ intercalate "\t" (map renderOneLine argOut) ++ "\n")
+     io $ writeFile outFile (concat out) `X.catch` handler
+  where
+    handler :: X.SomeException -> IO ()
+    handler e = putStrLn (X.displayException e)
+
+
 
 data QCMode = QCRandom | QCExhaust deriving (Eq, Show)
 
@@ -392,7 +425,7 @@ qcCmd qcMode str =
   lg2 :: Integer -> Integer
   lg2 x | x >= 2^(1024::Int) = 1024 + lg2 (x `div` 2^(1024::Int))
         | x == 0       = 0
-        | otherwise    = let valNumD = fromIntegral x :: Double
+        | otherwise    = let valNumD = fromInteger x :: Double
                          in round $ logBase 2 valNumD :: Integer
 
   prt msg   = rPutStr msg >> io (hFlush stdout)
@@ -559,7 +592,10 @@ cmdProveSat isSat str = do
                   [(t, e)] -> (t, [e])
                   _        -> collectTes resultRecs
           pexpr <- replParseExpr str
-          forM_ vss (printCounterexample isSat pexpr)
+
+          ~(EnvBool yes) <- getUser "show-examples"
+          when yes $ forM_ vss (printCounterexample isSat pexpr)
+
           case (ty, exprs) of
             (t, [e]) -> bindItVariable t e
             (t, es ) -> bindItVariables t es
@@ -574,6 +610,7 @@ onlineProveSat isSat str mfile = do
   proverName <- getKnownUser "prover"
   verbose <- getKnownUser "debug"
   satNum <- getUserSatNum
+  modelValidate <- getUserProverValidate
   parseExpr <- replParseExpr str
   (_, expr, schema) <- replCheckExpr parseExpr
   validEvalContext expr
@@ -584,6 +621,7 @@ onlineProveSat isSat str mfile = do
           pcQueryType    = if isSat then SatQuery satNum else ProveQuery
         , pcProverName   = proverName
         , pcVerbose      = verbose
+        , pcValidate     = modelValidate
         , pcProverStats  = timing
         , pcExtraDecls   = decls
         , pcSmtFile      = mfile
@@ -597,6 +635,7 @@ onlineProveSat isSat str mfile = do
 offlineProveSat :: Bool -> String -> Maybe FilePath -> REPL (Either String String)
 offlineProveSat isSat str mfile = do
   verbose <- getKnownUser "debug"
+  modelValidate <- getUserProverValidate
   parseExpr <- replParseExpr str
   (_, expr, schema) <- replCheckExpr parseExpr
   decls <- fmap M.deDecls getDynEnv
@@ -605,6 +644,7 @@ offlineProveSat isSat str mfile = do
           pcQueryType    = if isSat then SatQuery (SomeSat 0) else ProveQuery
         , pcProverName   = "offline"
         , pcVerbose      = verbose
+        , pcValidate     = modelValidate
         , pcProverStats  = timing
         , pcExtraDecls   = decls
         , pcSmtFile      = mfile
@@ -742,30 +782,54 @@ reloadCmd  = do
     Just lm  ->
       case lName lm of
         Just m | M.isParamInstModName m -> loadHelper (M.loadModuleByName m)
-        _ -> loadCmd (lPath lm)
+        _ -> case lPath lm of
+               M.InFile f -> loadCmd f
+               _ -> return ()
     Nothing -> return ()
 
 
 editCmd :: String -> REPL ()
-editCmd path
-  | null path = do
-      mb <- getLoadedMod
-      case mb of
+editCmd path =
+  do mbE <- getEditPath
+     mbL <- getLoadedMod
+     if not (null path)
+        then do when (isNothing mbL)
+                  $ setLoadedMod LoadedModule { lName = Nothing
+                                              , lPath = M.InFile path }
+                doEdit path
+        else case msum [ M.InFile <$> mbE, lPath <$> mbL ] of
+               Nothing -> rPutStrLn "No filed to edit."
+               Just p  ->
+                  case p of
+                    M.InFile f   -> doEdit f
+                    M.InMem l bs -> withROTempFile l bs replEdit >> pure ()
+  where
+  doEdit p =
+    do setEditPath p
+       _ <- replEdit p
+       reloadCmd
 
-        Just m -> do
-          success <- replEdit (lPath m)
-          if success
-             then reloadCmd
-             else return ()
+withROTempFile :: String -> ByteString -> (FilePath -> REPL a) -> REPL a
+withROTempFile name cnt k =
+  do (path,h) <- mkTmp
+     do mkFile path h
+        k path
+      `finally` liftIO (do hClose h
+                           removeFile path)
+  where
+  mkTmp =
+    liftIO $
+    do tmp <- getTemporaryDirectory
+       let esc c = if isAscii c && isAlphaNum c then c else '_'
+       openTempFile tmp (map esc name ++ ".cry")
 
-        Nothing   -> do
-          rPutStrLn "No files to edit."
-          return ()
+  mkFile path h =
+    liftIO $
+    do BS8.hPutStrLn h cnt
+       hFlush h
+       setPermissions path (setOwnerReadable True emptyPermissions)
 
-  | otherwise = do
-      _  <- replEdit path
-      setEditPath path
-      reloadCmd
+
 
 moduleCmd :: String -> REPL ()
 moduleCmd modString
@@ -781,10 +845,15 @@ loadPrelude  = moduleCmd $ show $ pp M.preludeName
 loadCmd :: FilePath -> REPL ()
 loadCmd path
   | null path = return ()
+
+  -- when `:load`, the edit and focused paths become the parameter
   | otherwise = do setEditPath path
+                   setLoadedMod LoadedModule { lName = Nothing
+                                             , lPath = M.InFile path
+                                             }
                    loadHelper (M.loadModuleByPath path)
 
-loadHelper :: M.ModuleCmd (FilePath,T.Module) -> REPL ()
+loadHelper :: M.ModuleCmd (M.ModulePath,T.Module) -> REPL ()
 loadHelper how =
   do clearLoadedMod
      (path,m) <- liftModuleCmd how
@@ -793,6 +862,10 @@ loadHelper how =
         { lName = Just (T.mName m)
         , lPath = path
         }
+     -- after a successful load, the current module becomes the edit target
+     case path of
+       M.InFile f -> setEditPath f
+       M.InMem {} -> clearEditPath
      setDynEnv mempty
 
 quitCmd :: REPL ()
@@ -801,7 +874,7 @@ quitCmd  = stop
 
 browseCmd :: String -> REPL ()
 browseCmd input = do
-  (_, iface, fNames, disp) <- getFocusedEnv
+  (params, iface, fNames, disp) <- getFocusedEnv
   denv <- getDynEnv
   let names = M.deNames denv `M.shadowing` fNames
 
@@ -822,13 +895,41 @@ browseCmd input = do
 
       restricted = if null mnames then const True else hasAnyModName mnames
 
-      visibleType = isUser &&& restricted &&& inSet visibleTypes
-      visibleDecl = isUser &&& restricted &&& inSet visibleDecls
+      visibleType  = isUser &&& restricted &&& inSet visibleTypes
+      visibleDecl  = isUser &&& restricted &&& inSet visibleDecls
 
 
-  browseTSyns    visibleType iface disp
-  browseNewtypes visibleType iface disp
-  browseVars     visibleDecl iface disp
+  browseMParams  visibleType visibleDecl params disp
+  browseTSyns    visibleType             iface disp
+  browsePrimTys  visibleType             iface disp
+  browseNewtypes visibleType             iface disp
+  browseVars     visibleDecl             iface disp
+
+
+browseMParams :: (M.Name -> Bool) -> (M.Name -> Bool) ->
+                 M.IfaceParams-> NameDisp -> REPL ()
+browseMParams visT visD M.IfaceParams { .. } names =
+  do ppBlock names ppParamTy "Type Parameters"
+                              (sorted visT T.mtpName ifParamTypes)
+     ppBlock names ppParamFu "Value Parameters"
+                              (sorted visD T.mvpName ifParamFuns)
+
+  where
+  ppParamTy T.ModTParam { .. } = hang ("type" <+> pp mtpName <+> ":")
+                                                           2 (pp mtpKind)
+  ppParamFu T.ModVParam { .. } = hang (pp mvpName <+> ":") 2 (pp mvpType)
+
+  sorted vis nm mp = sortBy (M.cmpNameDisplay names `on` nm)
+               $ filter (vis . nm) $ Map.elems mp
+
+
+browsePrimTys :: (M.Name -> Bool) -> M.IfaceDecls -> NameDisp -> REPL ()
+browsePrimTys isVisible M.IfaceDecls { .. } names =
+  do let pts = sortBy (M.cmpNameDisplay names `on` T.atName)
+               [ ts | ts <- Map.elems ifAbstractTypes, isVisible (T.atName ts) ]
+     ppBlock names ppA "Primitive Types" pts
+  where
+  ppA a = pp (T.atName a) <+> ":" <+> pp (T.atKind a)
 
 browseTSyns :: (M.Name -> Bool) -> M.IfaceDecls -> NameDisp -> REPL ()
 browseTSyns isVisible M.IfaceDecls { .. } names = do
@@ -924,13 +1025,14 @@ helpCmd cmd
         do (params,env,rnEnv,nameEnv) <- getFocusedEnv
            let vNames = M.lookupValNames  qname rnEnv
                tNames = M.lookupTypeNames qname rnEnv
-               pNames = T.primTyFromPName qname
 
-           mapM_ (showTypeHelp params env nameEnv) tNames
-           mapM_ (showValHelp params env nameEnv qname) vNames
-           mapM_ (showPrimTyHelp nameEnv) pNames
+           let helps = map (showTypeHelp params env nameEnv) tNames ++
+                       map (showValHelp params env nameEnv qname) vNames
 
-           when (null (vNames ++ tNames) && pNames == Nothing) $
+               separ = rPutStrLn "            ~~~ * ~~~"
+           sequence_ (intersperse separ helps)
+
+           when (null (vNames ++ tNames)) $
              rPrint $ "Undefined name:" <+> pp qname
       Nothing ->
            rPutStrLn ("Unable to parse name: " ++ cmd)
@@ -942,21 +1044,11 @@ helpCmd cmd
                       rPrint $runDoc nameEnv ("Name defined in module" <+> pp m)
       M.Parameter  -> rPutStrLn "// No documentation is available."
 
-  showPrimTyHelp nameEnv pt =
-    do rPutStrLn ""
-       let i    = T.primTyIdent pt
-           nm   = pp (T.primTyIdent pt)
-           pnam = if P.isInfixIdent i then parens nm else nm
-           sig  = "primitive type" <+> pnam <+> ":" <+> pp (T.kindOf (T.primTyCon pt))
-       rPrint $ runDoc nameEnv $ nest 4 sig
-       doShowFix (T.primTyFixity pt)
-       rPutStrLn ""
-       rPutStrLn (T.primTyDoc pt)
-       rPutStrLn ""
+
 
   showTypeHelp params env nameEnv name =
     fromMaybe (noInfo nameEnv name) $
-    msum [ fromTySyn, fromNewtype, fromTyParam ]
+    msum [ fromTySyn, fromPrimType, fromNewtype, fromTyParam ]
 
     where
     fromTySyn =
@@ -967,6 +1059,31 @@ helpCmd cmd
       do nt <- Map.lookup name (M.ifNewtypes env)
          let decl = pp nt $$ (pp name <+> text ":" <+> pp (T.newtypeConType nt))
          return $ doShowTyHelp nameEnv decl (T.ntDoc nt)
+
+    fromPrimType =
+      do a <- Map.lookup name (M.ifAbstractTypes env)
+         pure $ do rPutStrLn ""
+                   rPrint $ runDoc nameEnv $ nest 4
+                          $ "primitive type" <+> pp (T.atName a)
+                                     <+> ":" <+> pp (T.atKind a)
+
+                   let (vs,cs) = T.atCtrs a
+                   unless (null cs) $
+                     do let example = T.TCon (T.abstractTypeTC a)
+                                             (map (T.TVar . T.tpVar) vs)
+                            ns = T.addTNames vs emptyNameMap
+                            rs = [ "•" <+> ppWithNames ns c | c <- cs ]
+                        rPutStrLn ""
+                        rPrint $ runDoc nameEnv $ nest 4 $
+                                    backticks (ppWithNames ns example) <+>
+                                    "requires:" $$ nest 2 (vcat rs)
+
+                   doShowFix (T.atFixitiy a)
+
+                   case T.atDoc a of
+                     Nothing -> pure ()
+                     Just d -> do rPutStrLn ""
+                                  rPutStrLn d
 
     fromTyParam =
       do p <- Map.lookup name (M.ifParamTypes params)
@@ -1049,7 +1166,7 @@ helpCmd cmd
 
   showCmdHelp c [arg] | ":set" `elem` cNames c = showOptionHelp arg
   showCmdHelp c _args =
-    do rPutStrLn ("\n    " ++ intercalate ", " (cNames c))
+    do rPutStrLn ("\n    " ++ intercalate ", " (cNames c) ++ " " ++ intercalate " " (cArgs c))
        rPutStrLn ""
        rPutStrLn (cHelp c)
        rPutStrLn ""
@@ -1156,8 +1273,12 @@ moduleCmdResult (res,ws0) = do
     Right (a,me') -> setModuleEnv me' >> return a
     Left err      ->
       do e <- case err of
-                M.ErrorInFile file e -> do setEditPath file
-                                           return e
+                M.ErrorInFile (M.InFile file) e ->
+                  -- on error, the file with the error becomes the edit
+                  -- target.  Note, however, that the focused module is not
+                  -- changed.
+                  do setEditPath file
+                     return e
                 _ -> return err
          raise (ModuleSystemError names e)
 

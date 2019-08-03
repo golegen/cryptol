@@ -50,6 +50,7 @@ instantiateModule func newName tpMap vpMap =
            renamedExports  = inst env (mExports func)
            renamedTySyns   = rnMp tsName (mTySyns func)
            renamedNewtypes = rnMp ntName (mNewtypes func)
+           renamedPrimTys  = rnMp atName (mPrimTypes func)
 
            su = listParamSubst (Map.toList (tyParamMap env))
 
@@ -66,6 +67,7 @@ instantiateModule func newName tpMap vpMap =
                  , mImports           = mImports func
                  , mTySyns            = renamedTySyns
                  , mNewtypes          = renamedNewtypes
+                 , mPrimTypes         = renamedPrimTys
                  , mParamTypes        = Map.empty
                  , mParamConstraints  = []
                  , mParamFuns         = Map.empty
@@ -185,6 +187,7 @@ instance Inst Expr where
         ETuple es                 -> ETuple (inst env es)
         ERec xs                   -> ERec [ (f,go e) | (f,e) <- xs ]
         ESel e s                  -> ESel (go e) s
+        ESet e x v                -> ESet (go e) x (go v)
         EIf e1 e2 e3              -> EIf (go e1) (go e2) (go e3)
         EComp t1 t2 e mss         -> EComp (inst env t1) (inst env t2)
                                            (go e)
@@ -249,8 +252,9 @@ instance Inst TCon where
 instance Inst TC where
   inst env tc =
     case tc of
-      TCNewtype x -> TCNewtype (inst env x)
-      _           -> tc
+      TCNewtype x  -> TCNewtype (inst env x)
+      TCAbstract x -> TCAbstract (inst env x)
+      _            -> tc
 
 instance Inst UserTC where
   inst env (UserTC x t) = UserTC y t
@@ -280,6 +284,15 @@ instance Inst Newtype where
                         , ntDoc = ntDoc nt
                         }
     where x = ntName nt
+
+instance Inst AbstractType where
+  inst env a = AbstractType { atName    = instTyName env (atName a)
+                            , atKind    = atKind a
+                            , atCtrs    = case atCtrs a of
+                                            (xs,ps) -> (xs, inst env ps)
+                            , atFixitiy = atFixitiy a
+                            , atDoc     = atDoc a
+                            }
 
 instTyName :: Env -> Name -> Name
 instTyName env x = Map.findWithDefault x x (tyNameMap env)

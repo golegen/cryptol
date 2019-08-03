@@ -5,6 +5,7 @@ ARCH    := $(shell uname -m)
 
 TESTS ?= modsys parser issues regression renamer mono-binds
 DIFF ?= meld
+TIME ?= time
 
 IGNORE_EXPECTED ?= --ignore-expected
 
@@ -168,20 +169,12 @@ PKG_EXAMPLE_FILES := docs/ProgrammingCryptol/aes/AES.cry \
                      examples/Cipher.cry \
                      examples/DES.cry \
                      examples/DEStest.cry \
-                     examples/FNV-a1.cry \
-                     examples/SHA1.cry \
-                     examples/SIV-rfc5297.md \
-                     examples/Salsa20.cry \
                      examples/Test.cry \
-                     examples/TripleDES.cry \
-                     examples/ZUC.cry \
 
 PKG_EXCONTRIB_FILES := examples/contrib/EvenMansour.cry \
                        examples/contrib/RC4.cry \
                        examples/contrib/README.md \
                        examples/contrib/mkrand.cry \
-                       examples/contrib/simon.cry \
-                       examples/contrib/speck.cry \
 
 PKG_EXFUNSTUFF_FILES := examples/funstuff/Coins.cry \
                         examples/funstuff/FoxChickenCorn.cry \
@@ -253,9 +246,9 @@ ${CS_BIN}/cryptol-test-runner: \
 test: ${CS_BIN}/cryptol-test-runner
 	( cd tests &&                                                      \
 	echo "Testing on $(UNAME)-$(ARCH)" &&                              \
-	time $(realpath $(CS_BIN)/cryptol-test-runner)                     \
+	${TIME} $(realpath $(CS_BIN)/cryptol-test-runner)                     \
 	  $(TESTS)                                                         \
-	  -c $(call adjust-path,${CURDIR}/${PKG_BIN}/cryptol${EXE_EXT})    \
+	  --exe $(call adjust-path,${CURDIR}/${PKG_BIN}/cryptol${EXE_EXT}) \
 	  -r output                                                        \
 	  -T --hide-successes                                              \
 	  -T --jxml=$(call adjust-path,$(CURDIR)/results.xml)              \

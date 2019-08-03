@@ -27,7 +27,7 @@ import Cryptol.Utils.PP
 import Cryptol.Utils.Panic (panic)
 
 import Data.List (nub)
-import Data.Maybe (catMaybes,fromMaybe,mapMaybe)
+import Data.Maybe (fromMaybe)
 import qualified Data.Map.Strict as Map
 import qualified Data.Set as Set
 import Data.Semigroup
@@ -48,8 +48,6 @@ data NamingEnv = NamingEnv { neExprs :: !(Map.Map PName [Name])
                              -- ^ Expr renaming environment
                            , neTypes :: !(Map.Map PName [Name])
                              -- ^ Type renaming environment
-                           , neFixity:: !(Map.Map Name Fixity)
-                             -- ^ Expression-level fixity environment
                            } deriving (Show, Generic, NFData)
 
 -- | Return a list of value-level names to which this parsed name may refer.
@@ -65,23 +63,18 @@ lookupTypeNames qn ro = Map.findWithDefault [] qn (neTypes ro)
 instance Semigroup NamingEnv where
   l <> r   =
     NamingEnv { neExprs  = Map.unionWith merge (neExprs  l) (neExprs  r)
-              , neTypes  = Map.unionWith merge (neTypes  l) (neTypes  r)
-              , neFixity = Map.union           (neFixity l) (neFixity r) }
+              , neTypes  = Map.unionWith merge (neTypes  l) (neTypes  r) }
 
 instance Monoid NamingEnv where
   mempty        =
     NamingEnv { neExprs  = Map.empty
-              , neTypes  = Map.empty
-              , neFixity = Map.empty }
+              , neTypes  = Map.empty }
 
-  -- NOTE: merging the fixity maps is a special case that just prefers the left
-  -- entry, as they're already keyed by a name with a unique
   mappend l r   = l <> r
 
   mconcat envs  =
     NamingEnv { neExprs  = Map.unionsWith merge (map neExprs  envs)
-              , neTypes  = Map.unionsWith merge (map neTypes  envs)
-              , neFixity = Map.unions           (map neFixity envs) }
+              , neTypes  = Map.unionsWith merge (map neTypes  envs) }
 
   {-# INLINE mempty #-}
   {-# INLINE mappend #-}
@@ -174,11 +167,10 @@ singletonE qn en = mempty { neExprs = Map.singleton qn [en] }
 shadowing :: NamingEnv -> NamingEnv -> NamingEnv
 shadowing l r = NamingEnv
   { neExprs  = Map.union (neExprs  l) (neExprs  r)
-  , neTypes  = Map.union (neTypes  l) (neTypes  r)
-  , neFixity = Map.union (neFixity l) (neFixity r) }
+  , neTypes  = Map.union (neTypes  l) (neTypes  r) }
 
 travNamingEnv :: Applicative f => (Name -> f Name) -> NamingEnv -> f NamingEnv
-travNamingEnv f ne = NamingEnv <$> neExprs' <*> neTypes' <*> pure (neFixity ne)
+travNamingEnv f ne = NamingEnv <$> neExprs' <*> neTypes'
   where
     neExprs' = traverse (traverse f) (neExprs ne)
     neTypes' = traverse (traverse f) (neTypes ne)
@@ -268,19 +260,15 @@ interpImport imp publicDecls = qualified
 -- the names are qualified.
 unqualifiedEnv :: IfaceDecls -> NamingEnv
 unqualifiedEnv IfaceDecls { .. } =
-  mconcat [ exprs, tySyns, ntTypes, ntExprs
-          , mempty { neFixity = Map.fromList fixity } ]
+  mconcat [ exprs, tySyns, ntTypes, absTys, ntExprs ]
   where
   toPName n = mkUnqual (nameIdent n)
 
   exprs   = mconcat [ singletonE (toPName n) n | n <- Map.keys ifDecls ]
   tySyns  = mconcat [ singletonT (toPName n) n | n <- Map.keys ifTySyns ]
   ntTypes = mconcat [ singletonT (toPName n) n | n <- Map.keys ifNewtypes ]
+  absTys  = mconcat [ singletonT (toPName n) n | n <- Map.keys ifAbstractTypes ]
   ntExprs = mconcat [ singletonE (toPName n) n | n <- Map.keys ifNewtypes ]
-
-  fixity =
-    catMaybes [ do f <- ifDeclFixity d; return (ifDeclName d,f)
-              | d    <- Map.elems ifDecls ]
 
 
 -- | Compute an unqualified naming environment, containing the various module
@@ -289,7 +277,6 @@ modParamsNamingEnv :: IfaceParams -> NamingEnv
 modParamsNamingEnv IfaceParams { .. } =
   NamingEnv { neExprs = Map.fromList $ map fromFu $ Map.keys ifParamFuns
             , neTypes = Map.fromList $ map fromTy $ Map.elems ifParamTypes
-            , neFixity = Map.fromList $ mapMaybe toFix $ Map.elems ifParamFuns
             }
 
   where
@@ -299,9 +286,6 @@ modParamsNamingEnv IfaceParams { .. } =
               in (toPName nm, [nm])
 
   fromFu f  = (toPName f, [f])
-
-  toFix x = do d <- T.mvpFixity x
-               return (T.mvpName x, d)
 
 
 
@@ -320,11 +304,7 @@ instance BindsNames (InModule (Bind PName)) where
     do let Located { .. } = bName b
        n <- newTop ns thing (bFixity b) srcRange
 
-       let fixity = case bFixity b of
-             Just f  -> mempty { neFixity = Map.singleton n f }
-             Nothing -> mempty
-
-       return (singletonE thing n `mappend` fixity)
+       return (singletonE thing n)
 
 -- | Generate the naming environment for a type parameter.
 instance BindsNames (TParam PName) where
@@ -344,11 +324,19 @@ instance BindsNames (InModule (TopDecl PName)) where
   namingEnv (InModule ns td) =
     case td of
       Decl d           -> namingEnv (InModule ns (tlValue d))
+      DPrimType d      -> namingEnv (InModule ns (tlValue d))
       TDNewtype d      -> namingEnv (InModule ns (tlValue d))
       DParameterType d -> namingEnv (InModule ns d)
       DParameterConstraint {} -> mempty
       DParameterFun  d -> namingEnv (InModule ns d)
       Include _   -> mempty
+
+instance BindsNames (InModule (PrimType PName)) where
+  namingEnv (InModule ns PrimType { .. }) =
+    BuildNamingEnv $
+      do let Located { .. } = primTName
+         nm <- newTop ns thing primTFixity srcRange
+         pure (singletonT thing nm)
 
 instance BindsNames (InModule (ParameterFun PName)) where
   namingEnv (InModule ns ParameterFun { .. }) = BuildNamingEnv $
@@ -377,12 +365,12 @@ instance BindsNames (InModule (Decl PName)) where
   namingEnv (InModule pfx d) = case d of
     DBind b -> BuildNamingEnv $
       do n <- mkName (bName b) (bFixity b)
-         return (singletonE (thing (bName b)) n `mappend` fixity n b)
+         return (singletonE (thing (bName b)) n)
 
     DSignature ns _sig      -> foldMap qualBind ns
     DPragma ns _p           -> foldMap qualBind ns
-    DType (TySyn lqn _ _)   -> qualType lqn
-    DProp (PropSyn lqn _ _) -> qualType lqn
+    DType syn               -> qualType (tsName syn) (tsFixity syn)
+    DProp syn               -> qualType (psName syn) (psFixity syn)
     DLocated d' _           -> namingEnv (InModule pfx d')
     DPatBind _pat _e        -> panic "ModuleSystem" ["Unexpected pattern binding"]
     DFixity{}               -> panic "ModuleSystem" ["Unexpected fixity declaration"]
@@ -395,11 +383,6 @@ instance BindsNames (InModule (Decl PName)) where
       do n <- mkName ln Nothing
          return (singletonE (thing ln) n)
 
-    qualType ln = BuildNamingEnv $
-      do n <- mkName ln Nothing
+    qualType ln f = BuildNamingEnv $
+      do n <- mkName ln f
          return (singletonT (thing ln) n)
-
-    fixity n b =
-      case bFixity b of
-        Just f  -> mempty { neFixity = Map.singleton n f }
-        Nothing -> mempty

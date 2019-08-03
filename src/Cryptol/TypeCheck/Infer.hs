@@ -12,6 +12,7 @@
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE ViewPatterns #-}
 {-# LANGUAGE RecursiveDo #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE Safe #-}
 module Cryptol.TypeCheck.Infer
   ( checkE
@@ -22,7 +23,7 @@ module Cryptol.TypeCheck.Infer
   )
 where
 
-import           Cryptol.ModuleSystem.Name (asPrim,lookupPrimDecl)
+import           Cryptol.ModuleSystem.Name (asPrim,lookupPrimDecl,nameLoc)
 import           Cryptol.Parser.Position
 import qualified Cryptol.Parser.AST as P
 import qualified Cryptol.ModuleSystem.Exports as P
@@ -30,10 +31,11 @@ import           Cryptol.TypeCheck.AST hiding (tSub,tMul,tExp)
 import           Cryptol.TypeCheck.Monad
 import           Cryptol.TypeCheck.Error
 import           Cryptol.TypeCheck.Solve
-import           Cryptol.TypeCheck.SimpType(tSub,tMul,tExp,tAdd)
+import           Cryptol.TypeCheck.SimpType(tMul)
 import           Cryptol.TypeCheck.Kind(checkType,checkSchema,checkTySyn,
                                         checkPropSyn,checkNewtype,
                                         checkParameterType,
+                                        checkPrimType,
                                         checkParameterConstraints)
 import           Cryptol.TypeCheck.Instantiate
 import           Cryptol.TypeCheck.Depends
@@ -52,7 +54,7 @@ import           Data.Maybe(mapMaybe,isJust, fromMaybe)
 import           Data.List(partition,find)
 import           Data.Graph(SCC(..))
 import           Data.Traversable(forM)
-import           Control.Monad(zipWithM,unless)
+import           Control.Monad(zipWithM,unless,foldM)
 
 
 
@@ -62,6 +64,7 @@ inferModule m =
     do proveModuleTopLevel
        ts <- getTSyns
        nts <- getNewtypes
+       ats <- getAbstractTypes
        pTs <- getParamTypes
        pCs <- getParamConstraints
        pFuns <- getParamFuns
@@ -70,6 +73,7 @@ inferModule m =
                      , mImports   = map thing (P.mImports m)
                      , mTySyns    = Map.mapMaybe onlyLocal ts
                      , mNewtypes  = Map.mapMaybe onlyLocal nts
+                     , mPrimTypes = Map.mapMaybe onlyLocal ats
                      , mParamTypes = pTs
                      , mParamConstraints = pCs
                      , mParamFuns = pFuns
@@ -122,13 +126,14 @@ desugarLiteral fixDec lit =
            P.PolyLit _n  -> [ ("rep", P.TSeq P.TWild P.TBit) ]
 
        P.ECString s ->
-          P.ETyped (P.EList [ P.ELit (P.ECNum (fromIntegral (fromEnum c))
+          P.ETyped (P.EList [ P.ELit (P.ECNum (toInteger (fromEnum c))
                             P.CharLit) | c <- s ])
                    (P.TSeq P.TWild (P.TSeq (P.TNum 8) P.TBit))
 
 
+
 -- | Infer the type of an expression with an explicit instantiation.
-appTys :: P.Expr Name -> [Located (Maybe Ident,Type)] -> Type -> InferM Expr
+appTys :: P.Expr Name -> [TypeArg] -> Type -> InferM Expr
 appTys expr ts tGoal =
   case expr of
     P.EVar x ->
@@ -145,13 +150,7 @@ appTys expr ts tGoal =
                    appTys e ts tGoal
 
 
-    P.ENeg {} -> panic "appTys" ["[bug] renamer bug", "unexpected ENeg" ]
-    P.EComplement {} ->
-      panic "appTys" ["[bug] renamer bug", "unexpected EComplement" ]
-
-    P.EAppT e fs ->
-      do ps <- mapM inferTyParam fs
-         appTys e (ps ++ ts) tGoal
+    P.EAppT e fs -> appTys e (map uncheckedTypeArg fs ++ ts) tGoal
 
     -- Here is an example of why this might be useful:
     -- f ` { x = T } where type T = ...
@@ -163,8 +162,13 @@ appTys expr ts tGoal =
     P.ELocated e r ->
       inRange r (appTys e ts tGoal)
 
+    P.ENeg        {} -> mono
+    P.EComplement {} -> mono
+    P.EGenerate   {} -> mono
+
     P.ETuple    {} -> mono
     P.ERecord   {} -> mono
+    P.EUpd      {} -> mono
     P.ESel      {} -> mono
     P.EList     {} -> mono
     P.EFromTo   {} -> mono
@@ -175,6 +179,7 @@ appTys expr ts tGoal =
     P.ETyped    {} -> mono
     P.ETypeVal  {} -> mono
     P.EFun      {} -> mono
+    P.ESplit    {} -> mono
 
     P.EParens e       -> appTys e ts tGoal
     P.EInfix a op _ b -> appTys (P.EVar (thing op) `P.EApp` a `P.EApp` b) ts tGoal
@@ -183,32 +188,22 @@ appTys expr ts tGoal =
                   checkNoParams ts
                   return e'
 
-checkNoParams :: [Located (Maybe Ident,Type)] -> InferM ()
+checkNoParams :: [TypeArg] -> InferM ()
 checkNoParams ts =
   case pos of
-    p : _ -> inRange (srcRange p) (recordError TooManyPositionalTypeParams)
-    []    -> mapM_ badNamed named
+    p : _ -> do r <- case tyArgType p of
+                       Unchecked t | Just r <- getLoc t -> pure r
+                       _ -> curRange
+                inRange r (recordError TooManyPositionalTypeParams)
+    _ -> mapM_ badNamed named
   where
   badNamed l =
-    case fst (thing l) of
-      Just i -> recordError (UndefinedTypeParameter l { thing = i })
+    case tyArgName l of
+      Just i  -> recordError (UndefinedTypeParameter i)
       Nothing -> return ()
 
-  (named,pos) = partition (isJust . fst . thing) ts
+  (named,pos) = partition (isJust . tyArgName) ts
 
-
-inferTyParam :: P.TypeInst Name -> InferM (Located (Maybe Ident, Type))
-inferTyParam (P.NamedInst param) =
-  do let loc = srcRange (P.name param)
-     t <- inRange loc $ checkType (P.value param) Nothing
-     return $ Located loc (Just (thing (P.name param)), t)
-
-inferTyParam (P.PosInst param) =
-  do t   <- checkType param Nothing
-     rng <- case getLoc param of
-              Nothing -> curRange
-              Just r  -> return r
-     return Located { srcRange = rng, thing = (Nothing, t) }
 
 checkTypeOfKind :: P.Type Name -> Kind -> InferM Type
 checkTypeOfKind ty k = checkType ty (Just k)
@@ -228,9 +223,17 @@ checkE expr tGoal =
          checkHasType t tGoal
          return e'
 
-    P.ENeg {} -> panic "checkE" ["[bug] renamer bug", "unexpected ENeg" ]
-    P.EComplement {} ->
-      panic "checkE" ["[bug] renamer bug", "unexpected EComplement" ]
+    P.ENeg e ->
+      do prim <- mkPrim "negate"
+         checkE (P.EApp prim e) tGoal
+
+    P.EComplement e ->
+      do prim <- mkPrim "complement"
+         checkE (P.EApp prim e) tGoal
+
+    P.EGenerate e ->
+      do prim <- mkPrim "generate"
+         checkE (P.EApp prim e) tGoal
 
     P.ELit l@(P.ECNum _ P.DecLit) ->
       do e <- desugarLiteral False l
@@ -240,7 +243,10 @@ checkE expr tGoal =
          -- instantiate 'rep' to 'tGoal' in this case to avoid
          -- generating an unnecessary unification variable.
          loc <- curRange
-         appTys e [Located loc (Just (packIdent "rep"), tGoal)] tGoal
+         let arg = TypeArg { tyArgName = Just (Located loc (packIdent "rep"))
+                           , tyArgType = Checked tGoal
+                           }
+         appTys e [arg] tGoal
 
     P.ELit l -> (`checkE` tGoal) =<< desugarLiteral False l
 
@@ -254,15 +260,13 @@ checkE expr tGoal =
          es' <- zipWithM checkE es ts
          return (ERec (zip ns es'))
 
+    P.EUpd x fs -> checkRecUpd x fs tGoal
+
     P.ESel e l ->
-      do let src = case l of
-                     RecordSel la _ -> TypeOfRecordField la
-                     TupleSel n _   -> TypeOfTupleField n
-                     ListSel _ _    -> TypeOfSeqElement
-         t <- newType src KType
+      do t <- newType (selSrc l) KType
          e' <- checkE e t
          f <- newHasGoal l t tGoal
-         return (f e')
+         return (hasDoSelect f e')
 
     P.EList [] ->
       do (len,a) <- expectSeq tGoal
@@ -275,38 +279,18 @@ checkE expr tGoal =
          es' <- mapM (`checkE` a) es
          return (EList es' a)
 
-    P.EFromTo t1 Nothing Nothing ->
-      do rng <- curRange
-         fromThenPrim <- mkPrim' "fromThen"
-         let src = TypeParamInstNamed fromThenPrim (packIdent "bits")
-         bit <- newType src KNum
-         fstT <- checkTypeOfKind t1 KNum
-         let nextT = tAdd fstT (tNum (1::Int))
-             lenT  = tSub (tExp (tNum (2::Int)) bit) fstT
-
-         appTys (P.EVar fromThenPrim)
-           [ Located rng (Just (packIdent x), y)
-           | (x,y) <- [ ("first", fstT)
-                      , ("next", nextT)
-                      , ("len",   lenT)
-                      , ("bits",  bit) ]
-           ] tGoal
-
-    P.EFromTo t1 mbt2 mbt3 ->
+    P.EFromTo t1 mbt2 t3 mety ->
       do l <- curRange
+         let fs0 =
+               case mety of
+                 Just ety -> [("a", ety)]
+                 Nothing -> []
          let (c,fs) =
-               case (mbt2, mbt3) of
-
-                 (Nothing, Nothing) -> tcPanic "checkE"
-                                        [ "EFromTo _ Nothing Nothing" ]
-                 (Just t2, Nothing) ->
-                    ("fromThen", [ ("next", t2) ])
-
-                 (Nothing, Just t3) ->
-                    ("fromTo", [ ("last", t3) ])
-
-                 (Just t2, Just t3) ->
-                    ("fromThenTo", [ ("next",t2), ("last",t3) ])
+               case mbt2 of
+                 Nothing ->
+                    ("fromTo", ("last", t3) : fs0)
+                 Just t2 ->
+                    ("fromThenTo", ("next",t2) : ("last",t3) : fs0)
 
          prim <- mkPrim c
          let e' = P.EAppT prim
@@ -334,9 +318,7 @@ checkE expr tGoal =
          e'     <- withMonoTypes ds (checkE e a)
          return (EComp len a e' mss')
 
-    P.EAppT e fs ->
-      do ts <- mapM inferTyParam fs
-         appTys e ts tGoal
+    P.EAppT e fs -> appTys e (map uncheckedTypeArg fs) tGoal
 
     P.EApp fun@(dropLoc -> P.EApp (dropLoc -> P.EVar c) _)
            arg@(dropLoc -> P.ELit l)
@@ -382,9 +364,68 @@ checkE expr tGoal =
 
     P.ELocated e r  -> inRange r (checkE e tGoal)
 
+    P.ESplit e ->
+      do prim <- mkPrim "splitAt"
+         checkE (P.EApp prim e) tGoal
+
     P.EInfix a op _ b -> checkE (P.EVar (thing op) `P.EApp` a `P.EApp` b) tGoal
 
     P.EParens e -> checkE e tGoal
+
+
+selSrc :: P.Selector -> TVarSource
+selSrc l = case l of
+             RecordSel la _ -> TypeOfRecordField la
+             TupleSel n _   -> TypeOfTupleField n
+             ListSel _ _    -> TypeOfSeqElement
+
+checkRecUpd :: Maybe (P.Expr Name) -> [ P.UpdField Name ] -> Type -> InferM Expr
+checkRecUpd mb fs tGoal =
+  case mb of
+
+    -- { _ | fs } ~~>  \r -> { r | fs }
+    Nothing ->
+      do r <- newParamName (packIdent "r")
+         let p  = P.PVar Located { srcRange = nameLoc r, thing = r }
+             fe = P.EFun [p] (P.EUpd (Just (P.EVar r)) fs)
+         checkE fe tGoal
+
+    Just e ->
+      do e1 <- checkE e tGoal
+         foldM doUpd e1 fs
+
+  where
+  doUpd e (P.UpdField how sels v) =
+    case sels of
+      [l] ->
+        case how of
+          P.UpdSet ->
+            do ft <- newType (selSrc s) KType
+               v1 <- checkE v ft
+               d  <- newHasGoal s tGoal ft
+               pure (hasDoSet d e v1)
+          P.UpdFun ->
+             do ft <- newType (selSrc s) KType
+                v1 <- checkE v (tFun ft ft)
+                d  <- newHasGoal s tGoal ft
+                tmp <- newParamName (packIdent "rf")
+                let e' = EVar tmp
+                pure $ hasDoSet d e' (EApp v1 (hasDoSelect d e'))
+                       `EWhere`
+                       [  NonRecursive
+                          Decl { dName        = tmp
+                               , dSignature   = tMono tGoal
+                               , dDefinition  = DExpr e
+                               , dPragmas     = []
+                               , dInfix       = False
+                               , dFixity      = Nothing
+                               , dDoc         = Nothing
+                               } ]
+
+        where s = thing l
+      _ -> panic "checkRecUpd/doUpd" [ "Expected exactly 1 field label"
+                                     , "Got: " ++ show (length sels)
+                                     ]
 
 
 expectSeq :: Type -> InferM (Type,Type)
@@ -598,7 +639,7 @@ inferCArm :: Int -> [P.Match Name] -> InferM
               , Type                   -- length of sequence
               )
 
-inferCArm _ [] = panic "inferCArm" [ "Empty comprahension arm" ]
+inferCArm _ [] = panic "inferCArm" [ "Empty comprehension arm" ]
 inferCArm _ [m] =
   do (m1, x, t, n) <- inferMatch m
      return ([m1], Map.singleton x t, n)
@@ -610,7 +651,10 @@ inferCArm armNum (m : ms) =
      return (m1 : ms', Map.insertWith (\_ old -> old) x t ds, tMul n n')
 
 -- | @inferBinds isTopLevel isRec binds@ performs inference for a
--- strongly-connected component of 'P.Bind's. If @isTopLevel@ is true,
+-- strongly-connected component of 'P.Bind's.
+-- If any of the members of the recursive group are already marked
+-- as monomorphic, then we don't do generalzation.
+-- If @isTopLevel@ is true,
 -- any bindings without type signatures will be generalized. If it is
 -- false, and the mono-binds flag is enabled, no bindings without type
 -- signatures will be generalized, but bindings with signatures will
@@ -621,11 +665,10 @@ inferBinds isTopLevel isRec binds =
      -- declarations, mark all bindings lacking signatures as monomorphic
      monoBinds <- getMonoBinds
      let (sigs,noSigs) = partition (isJust . P.bSignature) binds
-         monos         = [ b { P.bMono = True } | b <- noSigs ]
-         binds' | monoBinds && not isTopLevel = sigs ++ monos
+         monos         = sigs ++ [ b { P.bMono = True } | b <- noSigs ]
+         binds' | any P.bMono binds           = monos
+                | monoBinds && not isTopLevel = monos
                 | otherwise                   = binds
-
-
 
          check exprMap =
         {- Guess type is here, because while we check user supplied signatures
@@ -909,6 +952,10 @@ inferDs ds continue = checkTyDecls =<< orderTyDecls (mapMaybe toTyDecl ds)
   checkTyDecls (NT t mbD : ts) =
     do t1 <- checkNewtype t mbD
        withNewtype t1 (checkTyDecls ts)
+
+  checkTyDecls (PT p mbD : ts) =
+    do p1 <- checkPrimType p mbD
+       withPrimType p1 (checkTyDecls ts)
 
   -- We checked all type synonyms, now continue with value-level definitions:
   checkTyDecls [] =

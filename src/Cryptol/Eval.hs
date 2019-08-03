@@ -25,6 +25,8 @@ module Cryptol.Eval (
   , emptyEnv
   , evalExpr
   , evalDecls
+  , evalSel
+  , evalSetSel
   , EvalError(..)
   , forceValue
   ) where
@@ -33,6 +35,7 @@ import Cryptol.Eval.Env
 import Cryptol.Eval.Monad
 import Cryptol.Eval.Type
 import Cryptol.Eval.Value
+import Cryptol.Parser.Selector(ppSelector)
 import Cryptol.ModuleSystem.Name
 import Cryptol.TypeCheck.AST
 import Cryptol.TypeCheck.Solver.InfNat(Nat'(..))
@@ -103,6 +106,10 @@ evalExpr env expr = case expr of
   ESel e sel -> {-# SCC "evalExpr->ESel" #-} do
      x <- eval e
      evalSel x sel
+
+  ESet e sel v -> {-# SCC "evalExpr->ESet" #-}
+    do x <- eval e
+       evalSetSel x sel (eval v)
 
   EIf c t f -> {-# SCC "evalExpr->EIf" #-} do
      b <- fromVBit <$> eval c
@@ -366,6 +373,8 @@ etaDelay msg env0 Forall{ sVars = vs0, sType = tp0 } = goTpVars env0 vs0
                 | (f,t) <- fs
                 ]
 
+      TVAbstract {} -> x
+
 
 declHole :: Decl
          -> Eval (Name, Schema, Eval (GenValue b w i), Eval (GenValue b w i) -> Eval ())
@@ -396,7 +405,10 @@ evalDecl :: EvalPrims b w i
          -> Eval (GenEvalEnv b w i)
 evalDecl renv env d =
   case dDefinition d of
-    DPrim   -> return $ bindVarDirect (dName d) (evalPrim d) env
+    DPrim   -> case evalPrim d of
+                 Just v  -> pure (bindVarDirect (dName d) v env)
+                 Nothing -> bindVar (dName d) (cryNoPrimError (dName d)) env
+
     DExpr e -> bindVar (dName d) (evalExpr renv e) env
 
 
@@ -443,8 +455,51 @@ evalSel val sel = case sel of
                               [ "Unexpected value in list selection"
                               , show vdoc ]
 
+evalSetSel :: forall b w i. EvalPrims b w i =>
+  GenValue b w i -> Selector -> Eval (GenValue b w i) -> Eval (GenValue b w i)
+evalSetSel e x v =
+  case x of
+    TupleSel n _  -> setTuple n
+    RecordSel n _ -> setRecord n
+    ListSel ix _  -> setList (toInteger ix)
 
+  where
+  bad msg =
+    do ed <- ppValue defaultPPOpts e
+       evalPanic "Cryptol.Eval.evalSetSel"
+          [ msg
+          , "Selector: " ++ show (ppSelector x)
+          , "Value: " ++ show ed
+          ]
 
+  setTuple n =
+    case e of
+      VTuple xs ->
+        case splitAt n xs of
+          (as, _: bs) -> pure (VTuple (as ++ v : bs))
+          _ -> bad "Tuple update out of bounds."
+      _ -> bad "Tuple update on a non-tuple."
+
+  setRecord n =
+    case e of
+      VRecord xs ->
+        case break ((n ==) . fst) xs of
+          (as, (i,_) : bs) -> pure (VRecord (as ++ (i,v) : bs))
+          _ -> bad "Missing field in record update."
+      _ -> bad "Record update on a non-record."
+
+  setList n =
+    case e of
+      VSeq i mp  -> pure $ VSeq i  $ updateSeqMap mp n v
+      VStream mp -> pure $ VStream $ updateSeqMap mp n v
+      VWord i m  -> pure $ VWord i $ do m1 <- m
+                                        updateWordValue m1 n asBit
+      _ -> bad "Sequence update on a non-sequence."
+
+  asBit = do res <- v
+             case res of
+               VBit b -> pure b
+               _      -> bad "Expected a bit, but got something else"
 
 -- List Comprehension Environments ---------------------------------------------
 
@@ -574,7 +629,5 @@ evalMatch lenv m = case m of
     where
       f env =
           case dDefinition d of
-            -- Primitives here should never happen, I think...
-            --    perhaps this should be converted to an error.
-            DPrim   -> return $ evalPrim d
+            DPrim   -> evalPanic "evalMatch" ["Unexpected local primitive"]
             DExpr e -> evalExpr env e
